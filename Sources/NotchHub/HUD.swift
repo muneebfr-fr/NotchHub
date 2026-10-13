@@ -384,19 +384,8 @@ struct HUDView: View {
         }
         .foregroundStyle(.white)
         .padding(.horizontal, 16)
-        .frame(width: 236, height: 40)
-        .glassEffect(.regular, in: .capsule)
+        .frame(width: HUDView.size.width, height: HUDView.size.height)
     }
-}
 
-/// Grows the HUD down out of the notch: it starts tucked up under the notch, narrow and transparent.
-struct NotchSlide: ViewModifier {
-    let progress: Double
-
-    func body(content: Content) -> some View {
-        content
-            .scaleEffect(x: 0.45 + 0.55 * progress, y: 0.6 + 0.4 * progress, anchor: .top)
-            .offset(y: (1 - progress) * -40)
-            .opacity(progress)
-    }
+    static let size = CGSize(width: 236, height: 40)
 }

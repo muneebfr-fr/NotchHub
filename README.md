@@ -6,7 +6,9 @@ A small macOS app that turns the MacBook notch into a hub. Hover over the notch 
 - **Clipboard history:** Text and images in separate tabs. Click an item to copy it again, or drag an image straight into another app. Password-manager secrets are skipped, and history is kept in memory only.
 - **Shortcuts:** One-click links to your sites, plus the Claude desktop app.
 - **Screen recording:** Record the screen with system audio to `~/Movies/NotchHub`. While it records, the collapsed notch shows a red dot and a timer, and NotchHub keeps itself out of the video.
-- **Volume and brightness bar:** A Liquid Glass bar that drops out of the notch and replaces the native macOS overlay.
+- **Volume and brightness bar:** A Liquid Glass bar that drips out of the notch like liquid and replaces the native macOS overlay. While the panel is open, it slides out from under the panel instead.
+- **Charging animation:** Plugging in sends a soft green light sweep across the notch, with a bolt and your battery percentage.
+- **Live indicators:** The collapsed notch shows music, recording or charging status, and blur-melts from one to the next.
 
 NotchHub has no Dock icon and starts automatically at login. To quit it, use the power button in the Shortcuts card. It starts again at your next login.
 
@@ -47,6 +49,10 @@ Create `~/Library/Application Support/NotchHub/links.json`:
 ```
 
 `symbol` is any [SF Symbols](https://developer.apple.com/sf-symbols/) name. Quit and reopen NotchHub to load your changes. Without this file, NotchHub shows a couple of example links.
+
+## Local add-ons
+
+If the app contains a class registered as `NotchHubLocalExtension` that conforms to `LocalExtension` (see `LocalExtensions.swift`), NotchHub loads it at launch, and otherwise nothing happens. This lets you keep personal features in a folder that git ignores only on your machine (for example by listing it in `.git/info/exclude`) without breaking the shared build.
 
 ## Screenshots in the image clipboard
 

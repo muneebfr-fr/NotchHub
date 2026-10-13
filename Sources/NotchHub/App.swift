@@ -15,6 +15,8 @@ enum Main {
 @MainActor
 final class NotchState: ObservableObject {
     static let expandedSize = CGSize(width: 680, height: 250)
+    /// Taller than the panel so cards that drop below the notch (e.g. a local add-on's answer card) have room.
+    static let windowSize = CGSize(width: 680, height: 520)
     @Published var expanded = false
     @Published var notchSize = CGSize(width: 200, height: 32)
 }
@@ -31,6 +33,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let music = MusicController()
     private let hud = HUDController()
     private let recorder = ScreenRecorder()
+    private let power = PowerMonitor()
+    private lazy var extensionHost = LocalExtensionHost(state: state)
+    private var localExtension: LocalExtension?
+    private var extensionIsInteractive = false
+    private var appBeforeExtension: NSRunningApplication?
     private var hoverTimer: Timer?
     private var outsideSince: Date?
 
@@ -51,13 +58,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
         panel.ignoresMouseEvents = true
         panel.acceptsMouseMovedEvents = true
+
+        extensionHost.setInteractive = { [weak self] interactive in
+            self?.setExtensionInteractive(interactive)
+        }
+        localExtension = LocalExtensions.load(host: extensionHost)
+
         let host = NSHostingView(
-            rootView: NotchView()
+            rootView: NotchView(localOverlay: localExtension?.overlay)
                 .environmentObject(state)
                 .environmentObject(clipboard)
                 .environmentObject(music)
                 .environmentObject(hud)
                 .environmentObject(recorder)
+                .environmentObject(power)
         )
         // The window has a fixed size, so skip SwiftUI's per-layout window size negotiation.
         host.sizingOptions = []
@@ -104,7 +118,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func positionPanel() {
         let screen = notchScreen
         state.notchSize = Self.notchSize(on: screen)
-        let size = NotchState.expandedSize
+        let size = NotchState.windowSize
         let frame = CGRect(
             x: screen.frame.midX - size.width / 2,
             y: screen.frame.maxY - size.height,
@@ -123,6 +137,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func checkHover() {
+        // While an add-on has focus (e.g. a text field), hovering mustn't open the panel over it.
+        guard !extensionIsInteractive else { return }
         let mouse = NSEvent.mouseLocation
         let frame = panel.frame
         let notch = state.notchSize
@@ -172,5 +188,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             state.expanded = expanded
         }
         panel.ignoresMouseEvents = !expanded
+    }
+
+    /// Gives an add-on clicks and keyboard focus without activating NotchHub, then hands focus back afterwards.
+    private func setExtensionInteractive(_ interactive: Bool) {
+        guard interactive != extensionIsInteractive else { return }
+        extensionIsInteractive = interactive
+        if interactive {
+            appBeforeExtension = NSWorkspace.shared.frontmostApplication
+            if state.expanded { setExpanded(false) }
+            panel.ignoresMouseEvents = false
+            panel.makeKey()
+        } else {
+            panel.ignoresMouseEvents = !state.expanded
+            appBeforeExtension?.activate()
+            appBeforeExtension = nil
+        }
     }
 }

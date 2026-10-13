@@ -19,20 +19,27 @@ struct NotchView: View {
     @EnvironmentObject var music: MusicController
     @EnvironmentObject var hud: HUDController
     @EnvironmentObject var recorder: ScreenRecorder
+    @EnvironmentObject var power: PowerMonitor
+    let localOverlay: AnyView?
 
     private let liveActivityWing: CGFloat = 34
 
-    private var showsRecording: Bool {
-        !state.expanded && recorder.isRecording
+    private enum WingMode: Hashable {
+        case none, music, recording, charging(Int)
     }
 
-    private var showsLiveActivity: Bool {
-        !state.expanded && (music.isPlaying || recorder.isRecording)
+    // Recording outranks charging, which outranks music, so the most important state is always visible.
+    private var wingMode: WingMode {
+        guard !state.expanded else { return .none }
+        if recorder.isRecording { return .recording }
+        if let flash = power.flash { return .charging(flash.percent) }
+        if music.isPlaying { return .music }
+        return .none
     }
 
     private var size: CGSize {
         if state.expanded { return NotchState.expandedSize }
-        let wings = showsLiveActivity ? liveActivityWing * 2 : 0
+        let wings = wingMode == .none ? 0 : liveActivityWing * 2
         return CGSize(width: state.notchSize.width + wings, height: state.notchSize.height)
     }
 
@@ -41,8 +48,17 @@ struct NotchView: View {
         let shape = UnevenRoundedRectangle(bottomLeadingRadius: radius, bottomTrailingRadius: radius, style: .continuous)
 
         ZStack(alignment: .top) {
+            // Drawn first so the black notch covers the hidden glass seed the HUD morphs out of.
+            hudGlass
+
             NotchSurface(expanded: state.expanded, notchHeight: state.notchSize.height, shape: shape)
                 .frame(width: size.width, height: size.height)
+
+            if case .charging = wingMode {
+                ChargingGlow(shape: shape)
+                    .frame(width: size.width, height: size.height)
+                    .transition(.opacity)
+            }
 
             if state.expanded {
                 ExpandedView()
@@ -57,41 +73,119 @@ struct NotchView: View {
                         ).animation(.spring(duration: 0.5, bounce: 0.1).delay(0.08)),
                         removal: .opacity.animation(.easeOut(duration: 0.12))
                     ))
-            } else if showsRecording {
-                // Recording takes priority over music so it's always obvious the screen is being captured.
-                HStack {
-                    RecordingDot()
-                    Spacer()
-                    RecordingTimer()
-                }
-                .padding(.horizontal, 9)
-                .frame(width: size.width, height: state.notchSize.height)
-                .transition(.opacity.animation(.easeInOut(duration: 0.25)))
-            } else if showsLiveActivity {
-                HStack {
-                    ArtworkView(image: music.artwork, size: 20, radius: 5)
-                    Spacer()
-                    EqualizerView()
-                }
-                .padding(.horizontal, 9)
-                .frame(width: size.width, height: state.notchSize.height)
-                .transition(.opacity.animation(.easeInOut(duration: 0.25)))
+            } else if wingMode != .none {
+                wings
+                    .padding(.horizontal, 9)
+                    .frame(width: size.width, height: state.notchSize.height)
+                    .transition(.blurReplace)
             }
 
-            if hud.visible && !state.expanded {
-                HUDView()
-                    .padding(.top, state.notchSize.height + 8)
-                    .transition(.modifier(
-                        active: NotchSlide(progress: 0),
-                        identity: NotchSlide(progress: 1)
-                    ))
+            if let localOverlay, !state.expanded {
+                localOverlay
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .foregroundStyle(Palette.primary)
         .fontDesign(.rounded)
         .environment(\.colorScheme, .dark)
-        .animation(.spring(duration: 0.45, bounce: 0.15), value: showsLiveActivity)
+        .animation(.spring(duration: 0.5, bounce: 0.18), value: wingMode)
+    }
+
+    /// The wing content melts (blur-replace) from one state into the next instead of cutting.
+    private var wings: some View {
+        Group {
+            switch wingMode {
+            case .recording:
+                HStack {
+                    RecordingDot()
+                    Spacer()
+                    RecordingTimer()
+                }
+            case .charging(let percent):
+                HStack {
+                    Image(systemName: "bolt.fill")
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundStyle(Color.green)
+                        .symbolEffect(.bounce, options: .nonRepeating)
+                        .frame(width: 20)
+                    Spacer()
+                    Text("\(percent)%")
+                        .font(.system(size: 11, weight: .semibold).monospacedDigit())
+                        .foregroundStyle(Color.green)
+                }
+            case .music:
+                HStack {
+                    ArtworkView(image: music.artwork, size: 20, radius: 5)
+                    Spacer()
+                    EqualizerView()
+                }
+            case .none:
+                EmptyView()
+            }
+        }
+        .id(wingMode)
+        .transition(.blurReplace)
+    }
+
+    /// One glass capsule that never leaves the hierarchy: hidden, it's tucked inside the physical notch;
+    /// shown, its frame springs down into the bar. A static seed in the same container stays fused to it
+    /// by a liquid neck while it's close, then the two snap apart, so the bar drips out of the notch.
+    private var hudGlass: some View {
+        let open = hud.visible
+        let seed = CGSize(width: 110, height: 16)
+        // Below the notch normally; below the open panel (it slides out from behind it) when expanded.
+        let restingTop = state.expanded
+            ? NotchState.expandedSize.height + 12
+            : state.notchSize.height + 14
+        let seedTop = max(0, state.notchSize.height - 18)
+
+        return GlassEffectContainer(spacing: 12) {
+            ZStack(alignment: .top) {
+                Color.clear
+                    .frame(width: seed.width, height: seed.height)
+                    .glassEffect(.regular, in: .capsule)
+                    .padding(.top, seedTop)
+
+                HUDView()
+                    .opacity(open ? 1 : 0)
+                    .scaleEffect(open ? 1 : 0.7)
+                    // Content fades in once the glass has mostly formed, and out immediately on close.
+                    .animation(open ? .easeOut(duration: 0.22).delay(0.12) : .easeIn(duration: 0.1), value: open)
+                    .frame(
+                        width: open ? HUDView.size.width : seed.width,
+                        height: open ? HUDView.size.height : seed.height
+                    )
+                    .clipShape(Capsule())
+                    .glassEffect(.regular, in: .capsule)
+                    // Resting 16pt below the seed, beyond the 12pt merge distance, so they separate once settled.
+                    .padding(.top, open ? restingTop : seedTop)
+            }
+        }
+        .allowsHitTesting(false)
+    }
+}
+
+/// A one-shot sweep of light across the notch plus a soft green rim, shown when the charger is connected.
+struct ChargingGlow: View {
+    let shape: UnevenRoundedRectangle
+    @State private var sweep: CGFloat = -0.4
+
+    var body: some View {
+        GeometryReader { geo in
+            LinearGradient(
+                colors: [.clear, Color.green.opacity(0.55), Color.white.opacity(0.35), Color.green.opacity(0.55), .clear],
+                startPoint: .leading, endPoint: .trailing
+            )
+            .frame(width: geo.size.width * 0.4)
+            .offset(x: geo.size.width * sweep)
+            .blendMode(.plusLighter)
+        }
+        .clipShape(shape)
+        .overlay(shape.stroke(Color.green.opacity(0.65), lineWidth: 1.5).blur(radius: 2.5))
+        .allowsHitTesting(false)
+        .onAppear {
+            withAnimation(.easeInOut(duration: 1.5)) { sweep = 1.0 }
+        }
     }
 }
 

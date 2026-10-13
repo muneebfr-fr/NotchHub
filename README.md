@@ -5,6 +5,7 @@ A small macOS app that turns the MacBook notch into a hub. Hover over the notch 
 - **Now Playing:** The Spotify or Apple Music track with album art, a progress bar and play/pause/skip controls. While music plays, the collapsed notch shows a mini cover and an animated equalizer.
 - **Clipboard history:** Text and images in separate tabs. Click an item to copy it again, or drag an image straight into another app. Password-manager secrets are skipped, and history is kept in memory only.
 - **Shortcuts:** One-click links to your sites, plus the Claude desktop app.
+- **Screen recording:** Record the screen with system audio to `~/Movies/NotchHub`. While it records, the collapsed notch shows a red dot and a timer, and NotchHub keeps itself out of the video.
 - **Volume and brightness bar:** A Liquid Glass bar that drops out of the notch and replaces the native macOS overlay.
 
 NotchHub has no Dock icon and starts automatically at login. To quit it, use the power button in the Shortcuts card. It starts again at your next login.
@@ -29,9 +30,10 @@ cd NotchHub
 | Prompt | Why |
 | --- | --- |
 | **Accessibility** | Lets NotchHub take over the volume, mute and brightness keys so the native overlay doesn't appear. Without it, the bar still shows for volume changes but the native overlay appears too. |
+| **Screen Recording** | Needed for the Record button. macOS may ask you to quit and reopen NotchHub after you allow it. |
 | **Automation (Spotify / Music)** | Lets NotchHub read the current track and send play, pause and skip commands. |
 
-Each build has a new signature, so macOS treats it as a new app. `build.sh` clears the old Accessibility entry and relaunches the app, so after rebuilding you only need to switch NotchHub back on when it asks.
+Each build has a new signature, so macOS treats it as a new app. `build.sh` clears the old Accessibility and Screen Recording entries and relaunches the app, so after rebuilding you only need to switch NotchHub back on when it asks.
 
 ## Your own shortcuts
 

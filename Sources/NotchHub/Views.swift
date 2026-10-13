@@ -18,11 +18,16 @@ struct NotchView: View {
     @EnvironmentObject var state: NotchState
     @EnvironmentObject var music: MusicController
     @EnvironmentObject var hud: HUDController
+    @EnvironmentObject var recorder: ScreenRecorder
 
     private let liveActivityWing: CGFloat = 34
 
+    private var showsRecording: Bool {
+        !state.expanded && recorder.isRecording
+    }
+
     private var showsLiveActivity: Bool {
-        !state.expanded && music.isPlaying
+        !state.expanded && (music.isPlaying || recorder.isRecording)
     }
 
     private var size: CGSize {
@@ -52,6 +57,16 @@ struct NotchView: View {
                         ).animation(.spring(duration: 0.5, bounce: 0.1).delay(0.08)),
                         removal: .opacity.animation(.easeOut(duration: 0.12))
                     ))
+            } else if showsRecording {
+                // Recording takes priority over music so it's always obvious the screen is being captured.
+                HStack {
+                    RecordingDot()
+                    Spacer()
+                    RecordingTimer()
+                }
+                .padding(.horizontal, 9)
+                .frame(width: size.width, height: state.notchSize.height)
+                .transition(.opacity.animation(.easeInOut(duration: 0.25)))
             } else if showsLiveActivity {
                 HStack {
                     ArtworkView(image: music.artwork, size: 20, radius: 5)
@@ -77,6 +92,39 @@ struct NotchView: View {
         .fontDesign(.rounded)
         .environment(\.colorScheme, .dark)
         .animation(.spring(duration: 0.45, bounce: 0.15), value: showsLiveActivity)
+    }
+}
+
+struct RecordingDot: View {
+    @State private var dim = false
+
+    var body: some View {
+        Circle()
+            .fill(Color.red)
+            .frame(width: 9, height: 9)
+            .opacity(dim ? 0.35 : 1)
+            .frame(width: 20)
+            .onAppear {
+                withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) { dim = true }
+            }
+    }
+}
+
+struct RecordingTimer: View {
+    @EnvironmentObject var recorder: ScreenRecorder
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 1)) { context in
+            Text(Self.elapsed(since: recorder.phase, now: context.date))
+                .font(.system(size: 11, weight: .semibold).monospacedDigit())
+                .foregroundStyle(Color.red.opacity(0.95))
+        }
+    }
+
+    static func elapsed(since phase: ScreenRecorder.Phase, now: Date) -> String {
+        guard case .recording(let start) = phase else { return "0:00" }
+        let s = max(0, Int(now.timeIntervalSince(start)))
+        return String(format: "%d:%02d", s / 60, s % 60)
     }
 }
 
@@ -565,6 +613,7 @@ struct ShortcutsCard: View {
                     shortcut(link.name, symbol: link.symbol) { NSWorkspace.shared.open(link.url) }
                 }
                     shortcut("Claude", symbol: "sparkles") { ClaudeShortcuts.openApp() }
+                    RecordButton()
                 }
             }
         }
@@ -577,16 +626,66 @@ struct ShortcutsCard: View {
                     .symbolRenderingMode(.hierarchical)
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(Palette.sky)
-                    .frame(width: 24, height: 24)
+                    .frame(width: 22, height: 22)
                 Text(title)
                     .font(.system(size: 12, weight: .medium))
                     .lineLimit(1)
                 Spacer(minLength: 0)
             }
-            .padding(5)
+            .padding(4)
             .contentShape(Rectangle())
-            .glassEffect(.regular.interactive(), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+            .glassEffect(.regular.interactive(), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
         }
         .buttonStyle(.plain)
+    }
+}
+
+struct RecordButton: View {
+    @EnvironmentObject var recorder: ScreenRecorder
+
+    private var label: (title: String, symbol: String, tint: Color) {
+        switch recorder.phase {
+        case .idle: return ("Record", "record.circle", Palette.sky)
+        case .starting: return ("Starting…", "record.circle", Palette.tertiary)
+        case .recording: return ("Stop", "stop.circle.fill", .red)
+        case .saved: return ("Show file", "checkmark.circle.fill", .green)
+        case .failed(let message): return (message, "exclamationmark.triangle.fill", .orange)
+        }
+    }
+
+    var body: some View {
+        let label = label
+
+        Button { recorder.toggle() } label: {
+            HStack(spacing: 9) {
+                Image(systemName: label.symbol)
+                    .symbolRenderingMode(.hierarchical)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(label.tint)
+                    .contentTransition(.symbolEffect(.replace))
+                    .frame(width: 22, height: 22)
+                Text(label.title)
+                    .font(.system(size: 12, weight: .medium))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+                Spacer(minLength: 0)
+                if recorder.isRecording {
+                    TimelineView(.periodic(from: .now, by: 1)) { context in
+                        Text(RecordingTimer.elapsed(since: recorder.phase, now: context.date))
+                            .font(.system(size: 11, weight: .medium).monospacedDigit())
+                            .foregroundStyle(Palette.secondary)
+                    }
+                }
+            }
+            .padding(4)
+            .contentShape(Rectangle())
+            .glassEffect(
+                recorder.isRecording ? .regular.tint(.red.opacity(0.35)).interactive() : .regular.interactive(),
+                in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+            )
+        }
+        .buttonStyle(.plain)
+        .help(recorder.isRecording ? "Stop recording" : "Record the screen with system audio to ~/Movies/NotchHub")
+        .animation(.spring(duration: 0.3, bounce: 0.2), value: recorder.phase)
     }
 }

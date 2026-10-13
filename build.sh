@@ -10,9 +10,10 @@ cp Info.plist "$APP/Contents/"
 codesign --force --sign - "$APP"
 echo "Built $APP"
 
-# A rebuild changes the app's signature, which silently invalidates its old Accessibility entry.
-# Clearing it lets the relaunched app show a fresh permission prompt.
+# A rebuild changes the app's signature, which silently invalidates its old permission entries.
+# Clearing them lets the relaunched app show fresh permission prompts.
 tccutil reset Accessibility local.notchhub
+tccutil reset ScreenCapture local.notchhub
 pkill -x NotchHub || true
 sleep 0.5
 open "$APP"

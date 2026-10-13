@@ -30,6 +30,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let clipboard = ClipboardStore()
     private let music = MusicController()
     private let hud = HUDController()
+    private let recorder = ScreenRecorder()
     private var hoverTimer: Timer?
     private var outsideSince: Date?
 
@@ -56,6 +57,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 .environmentObject(clipboard)
                 .environmentObject(music)
                 .environmentObject(hud)
+                .environmentObject(recorder)
         )
         // The window has a fixed size, so skip SwiftUI's per-layout window size negotiation.
         host.sizingOptions = []

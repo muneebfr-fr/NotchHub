@@ -7,7 +7,10 @@ final class GlassDockController: ObservableObject {
 
     nonisolated private static let bundleID = "local.glassdock"
     private static let enabledKey = "glassDockEnabled"
-    private static let appURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("GlassDock/build/GlassDock.app")
+    /// GlassDock lives in the same checkout: <repo>/build/NotchHub.app → <repo>/GlassDock/build/GlassDock.app.
+    private static let appURL = Bundle.main.bundleURL
+        .deletingLastPathComponent().deletingLastPathComponent()
+        .appendingPathComponent("GlassDock/build/GlassDock.app")
     private static let backupURL = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/Application Support/GlassDock/original-dock.plist")
 

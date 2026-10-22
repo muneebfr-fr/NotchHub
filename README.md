@@ -77,7 +77,16 @@ Add these hooks to `~/.claude/settings.json` (adjust the path if you cloned else
 
 ## GlassDock
 
-The Dock icon in the Shortcuts header turns GlassDock on and off. It expects the GlassDock app built at `~/GlassDock/build/GlassDock.app`, and is hidden if it isn't there.
+GlassDock (in the `GlassDock/` folder) is a companion app: a Liquid Glass replacement for the macOS Dock, drawn with Core Animation so magnification tracks the cursor at full frame rate.
+
+- Copies your current Dock's apps, order, icon size and magnification.
+- Live window previews on hover (click one to bring that window forward), running dots, unread badges, launch bounce.
+- Drag icons to reorder, drag one off the dock to remove it, drop files on an app or the Bin, right-click for the usual menu.
+- Auto-hides like the native Dock and stays out of full-screen apps.
+
+`./build.sh` builds it alongside NotchHub. Turn it on with the Dock icon in the Shortcuts header: the macOS Dock is hidden while it runs and your original settings are restored when you switch it off (or if it ever crashes three times in a minute). GlassDock asks for Accessibility (badges, focusing a window) and Screen Recording (previews).
+
+If your Dock ever stays hidden: `defaults delete com.apple.dock autohide; defaults delete com.apple.dock autohide-delay; killall Dock`
 
 ## Local add-ons
 

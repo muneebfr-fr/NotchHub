@@ -55,6 +55,44 @@ enum AppleScript {
     }
 }
 
+/// Runs AppleScript on one dedicated background thread so slow targets (Xcode, browsers, or a pending
+/// permission prompt) can never stall the notch. Scripts compiled here are only ever touched by that thread.
+final class BackgroundAppleScript: @unchecked Sendable {
+    static let shared = BackgroundAppleScript()
+
+    private let queue = DispatchQueue(label: "local.notchhub.applescript", qos: .utility)
+    private var compiled: [String: NSAppleScript] = [:]
+    private var inFlight: Set<String> = []
+
+    /// Skips the request if the same script is still running, so slow apps can't pile up work.
+    func run(_ source: String, completion: @escaping @MainActor (String?) -> Void) {
+        queue.async {
+            guard !self.inFlight.contains(source) else { return }
+            self.inFlight.insert(source)
+            let result = self.execute(source)
+            self.inFlight.remove(source)
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { completion(result) }
+            }
+        }
+    }
+
+    private func execute(_ source: String) -> String? {
+        let script: NSAppleScript
+        if let cached = compiled[source] {
+            script = cached
+        } else {
+            guard let fresh = NSAppleScript(source: source) else { return nil }
+            fresh.compileAndReturnError(nil)
+            compiled[source] = fresh
+            script = fresh
+        }
+        var error: NSDictionary?
+        let result = script.executeAndReturnError(&error)
+        return error == nil ? result.stringValue : nil
+    }
+}
+
 enum ClaudeShortcuts {
     static func openApp() {
         if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.anthropic.claudefordesktop") {
@@ -82,7 +120,7 @@ final class ClipboardStore: ObservableObject {
 
     private let maxItems = 10
     // Full-resolution screenshots can be several MB each, so image history is kept shorter.
-    private let maxImages = 8
+    private let maxImages = 16
     // Types password managers set to mark secrets that clipboard tools should not record.
     private let skippedTypes: Set<String> = [
         "org.nspasteboard.ConcealedType",
@@ -188,6 +226,7 @@ final class MusicController: ObservableObject {
     private var trackKey: String?
     private var timer: Timer?
     private var pendingPoll: DispatchWorkItem?
+    private var lastPoll = Date.distantPast
 
     init() {
         poll()
@@ -225,7 +264,13 @@ final class MusicController: ObservableObject {
         return min(duration, position + elapsed)
     }
 
+    /// Players announce their own changes, so opening the panel only needs a resync if it's been a while.
+    func refreshIfStale() {
+        if Date().timeIntervalSince(lastPoll) > 10 { poll() }
+    }
+
     func poll() {
+        lastPoll = Date()
         var paused: (String, [String])?
         // Only query running apps, since `tell application` would launch a closed one.
         for p in players where !NSRunningApplication.runningApplications(withBundleIdentifier: p.bundleID).isEmpty {

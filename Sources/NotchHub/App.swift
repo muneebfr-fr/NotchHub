@@ -1,10 +1,16 @@
 import AppKit
+import OSLog
 import ServiceManagement
 import SwiftUI
 
 @main
 enum Main {
     @MainActor static func main() {
+        // Claude Code hooks invoke this binary; forward the event and exit without starting the app.
+        if ClaudeHook.isInvocation {
+            ClaudeHook.run()
+            return
+        }
         let app = NSApplication.shared
         let delegate = AppDelegate()
         app.delegate = delegate
@@ -15,6 +21,8 @@ enum Main {
 @MainActor
 final class NotchState: ObservableObject {
     static let expandedSize = CGSize(width: 680, height: 250)
+    /// Extra panel height when the app in front contributes a controls strip.
+    static let contextStripHeight: CGFloat = 70
     /// Taller than the panel so cards that drop below the notch (e.g. a local add-on's answer card) have room.
     static let windowSize = CGSize(width: 680, height: 520)
     @Published var expanded = false
@@ -28,12 +36,21 @@ final class NotchPanel: NSPanel {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var panel: NotchPanel!
+    // private var petHost: NSView!  // Notch pet (parked, see NotchPet.swift)
     private let state = NotchState()
     private let clipboard = ClipboardStore()
     private let music = MusicController()
     private let hud = HUDController()
     private let recorder = ScreenRecorder()
     private let power = PowerMonitor()
+    private let sensors = SensorMonitor()
+    private let claudeCode = ClaudeCodeMonitor()
+    private let appContext = AppContextMonitor()
+    private let snapper = WindowSnapper()
+    private let downloads = DownloadsTidier()
+    private let mixer = VolumeMixer()
+    private let visualizer = AudioVisualizer()
+    private let glassDock = GlassDockController()
     private lazy var extensionHost = LocalExtensionHost(state: state)
     private var localExtension: LocalExtension?
     private var extensionIsInteractive = false
@@ -72,10 +89,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 .environmentObject(hud)
                 .environmentObject(recorder)
                 .environmentObject(power)
+                .environmentObject(sensors)
+                .environmentObject(claudeCode)
+                .environmentObject(appContext)
+                .environmentObject(downloads)
+                .environmentObject(mixer)
+                .environmentObject(visualizer)
+                .environmentObject(glassDock)
         )
         // The window has a fixed size, so skip SwiftUI's per-layout window size negotiation.
         host.sizingOptions = []
         panel.contentView = host
+
+        // Notch pet (parked, see NotchPet.swift):
+        // let petHost = NSHostingView(rootView: PetLayer().environmentObject(state).environmentObject(music))
+        // petHost.sizingOptions = []
+        // petHost.autoresizingMask = [.width, .minYMargin]
+        // host.addSubview(petHost)
+        // self.petHost = petHost
 
         positionPanel()
         panel.orderFrontRegardless()
@@ -99,6 +130,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hoverTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.checkHover() }
         }
+    }
+
+    /// While Mission Control (or App Exposé) is showing, the Dock adds an element identified "mc" to its
+    /// accessibility tree. Only checked when the cursor is at the notch, so it costs nothing otherwise.
+    private static func isMissionControlActive() -> Bool {
+        guard let dock = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.dock").first else { return false }
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(AXUIElementCreateApplication(dock.processIdentifier), kAXChildrenAttribute as CFString, &value) == .success,
+              let children = value as? [AXUIElement]
+        else { return false }
+        for child in children {
+            var identifier: CFTypeRef?
+            AXUIElementCopyAttributeValue(child, kAXIdentifierAttribute as CFString, &identifier)
+            if identifier as? String == "mc" {
+                Logger(subsystem: "local.notchhub", category: "hover").info("Mission Control is showing; not opening the panel")
+                return true
+            }
+        }
+        return false
     }
 
     // Re-registering every launch means quitting only stops the current session.
@@ -126,6 +176,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             height: size.height
         )
         panel.setFrame(frame, display: true)
+        // petHost.frame = CGRect(x: 0, y: size.height - PetLayer.height, width: size.width, height: PetLayer.height)
     }
 
     private static func notchSize(on screen: NSScreen) -> CGSize {
@@ -148,7 +199,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             width: notch.width,
             height: notch.height + 4
         ).insetBy(dx: -8, dy: 0)
-        let expanded = NotchState.expandedSize
+        let expanded = CGSize(
+            width: NotchState.expandedSize.width,
+            height: NotchState.expandedSize.height
+                + (appContext.hasStrip || downloads.hasLeftovers ? NotchState.contextStripHeight : 0)
+        )
         let panelRect = CGRect(
             x: frame.midX - expanded.width / 2,
             y: frame.maxY - expanded.height,
@@ -157,7 +212,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ).insetBy(dx: -16, dy: -16)
 
         if !state.expanded {
-            if notchRect.contains(mouse) { setExpanded(true) }
+            // Mission Control's Spaces bar lives at the top of the screen; reaching for it mustn't open the panel.
+            // A held button means something is being dragged (e.g. a window to the top edge), not a hover.
+            if notchRect.contains(mouse), NSEvent.pressedMouseButtons == 0, !Self.isMissionControlActive() {
+                setExpanded(true)
+            }
             return
         }
 
@@ -176,9 +235,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         outsideSince = nil
         guard expanded != state.expanded else { return }
         if expanded {
+            // The browser's front tab may have changed since it was activated.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+                MainActor.assumeIsolated { self?.appContext.refresh() }
+            }
             // Resync after the open animation so the AppleScript call can't stall its first frames.
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
-                MainActor.assumeIsolated { self?.music.poll() }
+                MainActor.assumeIsolated { self?.music.refreshIfStale() }
             }
         }
         let animation: Animation = expanded

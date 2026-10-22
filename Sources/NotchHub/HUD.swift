@@ -1,5 +1,6 @@
 import AppKit
 import AudioToolbox
+import Carbon
 import CoreAudio
 import OSLog
 import SwiftUI
@@ -229,7 +230,11 @@ final class MediaKeyTap {
 
 @MainActor
 final class HUDController: ObservableObject {
-    enum Kind { case volume, brightness }
+    enum Kind: Equatable {
+        case volume, brightness
+        case capsLock(on: Bool)
+        case inputSource(from: String, to: String, name: String)
+    }
 
     @Published private(set) var kind: Kind = .volume
     @Published private(set) var level: Double = 0
@@ -241,6 +246,8 @@ final class HUDController: ObservableObject {
     private var observedDevice: AudioDeviceID?
     private var deviceListener: AudioObjectPropertyListenerBlock?
     private var lastShownVolume: (Float, Bool)?
+    private var capsLockOn = NSEvent.modifierFlags.contains(.capsLock)
+    private var inputSource = HUDController.currentInputSource()
 
     init() {
         tap.onKey = { [weak self] key, fine in
@@ -248,6 +255,54 @@ final class HUDController: ObservableObject {
         }
         tap.start()
         observeOutputDevice()
+        observeKeyboardState()
+    }
+
+    // MARK: Caps Lock and keyboard language
+
+    private func observeKeyboardState() {
+        let handler: (NSEvent) -> Void = { [weak self] event in
+            MainActor.assumeIsolated { self?.modifiersChanged(event.modifierFlags) }
+        }
+        NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged, handler: handler)
+        NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) { event in
+            handler(event)
+            return event
+        }
+        DistributedNotificationCenter.default().addObserver(
+            forName: Notification.Name(kTISNotifySelectedKeyboardInputSourceChanged as String),
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.inputSourceChanged() }
+        }
+    }
+
+    private func modifiersChanged(_ flags: NSEvent.ModifierFlags) {
+        let on = flags.contains(.capsLock)
+        guard on != capsLockOn else { return }
+        capsLockOn = on
+        flash(.capsLock(on: on))
+    }
+
+    private func inputSourceChanged() {
+        let current = Self.currentInputSource()
+        guard current.code != inputSource.code || current.name != inputSource.name else { return }
+        let previous = inputSource
+        inputSource = current
+        flash(.inputSource(from: previous.code, to: current.code, name: current.name))
+    }
+
+    /// Short language code (e.g. "EN", "AR") and display name (e.g. "Arabic") of the active keyboard layout.
+    private static func currentInputSource() -> (code: String, name: String) {
+        let source = TISCopyCurrentKeyboardInputSource().takeRetainedValue()
+        func property(_ key: CFString) -> AnyObject? {
+            guard let pointer = TISGetInputSourceProperty(source, key) else { return nil }
+            return Unmanaged<AnyObject>.fromOpaque(pointer).takeUnretainedValue()
+        }
+        let name = property(kTISPropertyLocalizedName) as? String ?? "Keyboard"
+        let language = (property(kTISPropertyInputSourceLanguages) as? [String])?.first ?? name
+        let code = String(language.prefix(2)).uppercased()
+        return (code, name)
     }
 
     private func handle(_ key: MediaKey, fineStep: Bool) -> Bool {
@@ -291,7 +346,11 @@ final class HUDController: ObservableObject {
         return min(max((notches + (step > 0 ? 1 : -1)) * abs(step), 0), 1)
     }
 
-    private func show(_ kind: Kind, level: Float, muted: Bool) {
+    private func flash(_ kind: Kind) {
+        show(kind, level: Float(level), muted: false, duration: 1.3)
+    }
+
+    private func show(_ kind: Kind, level: Float, muted: Bool, duration: Double = 1.6) {
         withAnimation(.smooth(duration: 0.2)) {
             self.kind = kind
             self.level = Double(level)
@@ -308,7 +367,7 @@ final class HUDController: ObservableObject {
             }
         }
         hideWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6, execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration, execute: work)
     }
 
     // Without Accessibility the keys can't be intercepted, so changes are picked up from CoreAudio instead.
@@ -358,16 +417,59 @@ final class HUDController: ObservableObject {
 struct HUDView: View {
     @EnvironmentObject var hud: HUDController
 
-    private var symbol: String {
-        switch hud.kind {
-        case .volume: return hud.muted ? "speaker.slash.fill" : "speaker.wave.3.fill"
-        case .brightness: return hud.level < 0.5 ? "sun.min.fill" : "sun.max.fill"
+    var body: some View {
+        Group {
+            switch hud.kind {
+            case .volume, .brightness:
+                levelBar
+            case .capsLock(let on):
+                HStack(spacing: 10) {
+                    Image(systemName: on ? "capslock.fill" : "capslock")
+                        .font(.system(size: 14, weight: .semibold))
+                        .contentTransition(.symbolEffect(.replace))
+                        .frame(width: 22)
+                    Text(on ? "Caps Lock On" : "Caps Lock Off")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(.white.opacity(on ? 1 : 0.6))
+                    Spacer(minLength: 0)
+                    Circle()
+                        .fill(on ? Color.green : Color.white.opacity(0.2))
+                        .frame(width: 7, height: 7)
+                }
+            case .inputSource(let from, let to, let name):
+                HStack(spacing: 8) {
+                    Image(systemName: "globe")
+                        .font(.system(size: 13, weight: .semibold))
+                        .frame(width: 22)
+                    Text(from)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.45))
+                    Image(systemName: "arrow.right")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(.white.opacity(0.45))
+                    Text(to)
+                        .font(.system(size: 13, weight: .bold))
+                    Spacer(minLength: 4)
+                    Text(name)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.55))
+                        .lineLimit(1)
+                }
+            }
         }
+        .foregroundStyle(.white)
+        .padding(.horizontal, 16)
+        .frame(width: HUDView.size.width, height: HUDView.size.height)
     }
 
-    var body: some View {
+    private var levelSymbol: String {
+        if hud.kind == .volume { return hud.muted ? "speaker.slash.fill" : "speaker.wave.3.fill" }
+        return hud.level < 0.5 ? "sun.min.fill" : "sun.max.fill"
+    }
+
+    private var levelBar: some View {
         HStack(spacing: 12) {
-            Image(systemName: symbol, variableValue: hud.kind == .volume ? hud.level : nil)
+            Image(systemName: levelSymbol, variableValue: hud.kind == .volume ? hud.level : nil)
                 .font(.system(size: 14, weight: .semibold))
                 .contentTransition(.symbolEffect(.replace))
                 .frame(width: 22)
@@ -382,9 +484,6 @@ struct HUDView: View {
             }
             .frame(height: 6)
         }
-        .foregroundStyle(.white)
-        .padding(.horizontal, 16)
-        .frame(width: HUDView.size.width, height: HUDView.size.height)
     }
 
     static let size = CGSize(width: 236, height: 40)

@@ -8,13 +8,17 @@ final class PowerMonitor: ObservableObject {
         let percent: Int
     }
 
+    enum BatteryAlert { case none, low, critical }
+
     @Published private(set) var flash: Flash?
+    @Published private(set) var batteryAlert: BatteryAlert = .none
 
     private var onAC: Bool
     private var hideWork: DispatchWorkItem?
 
     init() {
         onAC = Self.isOnAC()
+        updateBatteryAlert(onAC: onAC)
         let context = Unmanaged.passUnretained(self).toOpaque()
         // Fires on any power-source change; only the battery → charger transition triggers the animation.
         let callback: IOPowerSourceCallbackType = { context in
@@ -29,6 +33,7 @@ final class PowerMonitor: ObservableObject {
 
     private func powerChanged() {
         let nowOnAC = Self.isOnAC()
+        updateBatteryAlert(onAC: nowOnAC)
         defer { onAC = nowOnAC }
         guard nowOnAC, !onAC, let percent = Self.batteryPercent() else { return }
 
@@ -39,6 +44,19 @@ final class PowerMonitor: ObservableObject {
         }
         hideWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 3.2, execute: work)
+    }
+
+    // The callback also fires as the charge level changes, so this tracks thresholds without polling.
+    private func updateBatteryAlert(onAC: Bool) {
+        let alert: BatteryAlert
+        if onAC {
+            alert = .none
+        } else if let percent = Self.batteryPercent() {
+            alert = percent <= 10 ? .critical : percent <= 20 ? .low : .none
+        } else {
+            alert = .none
+        }
+        if alert != batteryAlert { batteryAlert = alert }
     }
 
     private static func isOnAC() -> Bool {

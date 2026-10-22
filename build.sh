@@ -14,6 +14,7 @@ echo "Built $APP"
 # Clearing them lets the relaunched app show fresh permission prompts.
 tccutil reset Accessibility local.notchhub
 tccutil reset ScreenCapture local.notchhub
+tccutil reset AudioCapture local.notchhub || true
 pkill -x NotchHub || true
 sleep 0.5
 open "$APP"

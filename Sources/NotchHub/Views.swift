@@ -20,27 +20,44 @@ struct NotchView: View {
     @EnvironmentObject var hud: HUDController
     @EnvironmentObject var recorder: ScreenRecorder
     @EnvironmentObject var power: PowerMonitor
+    @EnvironmentObject var sensors: SensorMonitor
+    @EnvironmentObject var claudeCode: ClaudeCodeMonitor
+    @EnvironmentObject var appContext: AppContextMonitor
+    @EnvironmentObject var downloads: DownloadsTidier
     let localOverlay: AnyView?
 
     private let liveActivityWing: CGFloat = 34
 
     private enum WingMode: Hashable {
         case none, music, recording, charging(Int)
+        case sensors(camera: Bool, mic: Bool, apps: [String])
+        case claude(ClaudeCodeMonitor.Status)
+        case xcode(XcodeStatus)
     }
 
-    // Recording outranks charging, which outranks music, so the most important state is always visible.
+    // Most important first: our own recording, then who's using the camera/mic, then charging, then music.
     private var wingMode: WingMode {
         guard !state.expanded else { return .none }
         if recorder.isRecording { return .recording }
+        if sensors.isActive { return .sensors(camera: sensors.cameraOn, mic: sensors.micOn, apps: sensors.apps.map(\.id)) }
+        if case .needsInput = claudeCode.status { return .claude(claudeCode.status) }
+        if let build = appContext.xcodeWing { return .xcode(build) }
         if let flash = power.flash { return .charging(flash.percent) }
         if music.isPlaying { return .music }
         return .none
     }
 
     private var size: CGSize {
-        if state.expanded { return NotchState.expandedSize }
+        if state.expanded { return panelSize }
         let wings = wingMode == .none ? 0 : liveActivityWing * 2
         return CGSize(width: state.notchSize.width + wings, height: state.notchSize.height)
+    }
+
+    private var panelSize: CGSize {
+        CGSize(
+            width: NotchState.expandedSize.width,
+            height: NotchState.expandedSize.height + (hasBottomStrip ? NotchState.contextStripHeight : 0)
+        )
     }
 
     var body: some View {
@@ -54,6 +71,12 @@ struct NotchView: View {
             NotchSurface(expanded: state.expanded, notchHeight: state.notchSize.height, shape: shape)
                 .frame(width: size.width, height: size.height)
 
+            if power.batteryAlert != .none {
+                BatteryRim(shape: shape, color: power.batteryAlert == .critical ? .red : .orange)
+                    .frame(width: size.width, height: size.height)
+                    .transition(.opacity)
+            }
+
             if case .charging = wingMode {
                 ChargingGlow(shape: shape)
                     .frame(width: size.width, height: size.height)
@@ -61,11 +84,16 @@ struct NotchView: View {
             }
 
             if state.expanded {
-                ExpandedView()
+                ExpandedView(cardsHeight: NotchState.expandedSize.height - state.notchSize.height - 8 - 18)
                     .padding(.top, state.notchSize.height + 8)
                     .padding(.horizontal, 18)
                     .padding(.bottom, 18)
-                    .frame(width: size.width, height: size.height, alignment: .top)
+                    // Laid out once at full size and revealed by a mask that follows the growing shape,
+                    // so the cards aren't re-measured on every frame of the open animation.
+                    .frame(width: panelSize.width, height: panelSize.height, alignment: .top)
+                    .mask(alignment: .top) {
+                        shape.frame(width: size.width, height: size.height)
+                    }
                     .transition(.asymmetric(
                         insertion: .modifier(
                             active: SoftReveal(progress: 0),
@@ -89,7 +117,10 @@ struct NotchView: View {
         .fontDesign(.rounded)
         .environment(\.colorScheme, .dark)
         .animation(.spring(duration: 0.5, bounce: 0.18), value: wingMode)
+        .animation(.spring(duration: 0.45, bounce: 0.15), value: hasBottomStrip)
     }
+
+    private var hasBottomStrip: Bool { appContext.hasStrip || downloads.hasLeftovers }
 
     /// The wing content melts (blur-replace) from one state into the next instead of cutting.
     private var wings: some View {
@@ -113,6 +144,20 @@ struct NotchView: View {
                         .font(.system(size: 11, weight: .semibold).monospacedDigit())
                         .foregroundStyle(Color.green)
                 }
+            case .claude(let status):
+                ClaudeCodeWings(status: status)
+            case .xcode(let build):
+                XcodeWings(status: build)
+            case .sensors(let camera, let mic, _):
+                HStack {
+                    SensorAppIcons(apps: sensors.apps, camera: camera)
+                    Spacer()
+                    HStack(spacing: 4) {
+                        if camera { SensorDot(color: .green) }
+                        if mic { SensorDot(color: .orange) }
+                    }
+                    .frame(width: 20)
+                }
             case .music:
                 HStack {
                     ArtworkView(image: music.artwork, size: 20, radius: 5)
@@ -135,7 +180,7 @@ struct NotchView: View {
         let seed = CGSize(width: 110, height: 16)
         // Below the notch normally; below the open panel (it slides out from behind it) when expanded.
         let restingTop = state.expanded
-            ? NotchState.expandedSize.height + 12
+            ? panelSize.height + 12
             : state.notchSize.height + 14
         let seedTop = max(0, state.notchSize.height - 18)
 
@@ -162,6 +207,56 @@ struct NotchView: View {
             }
         }
         .allowsHitTesting(false)
+    }
+}
+
+/// Static (no animation, so no CPU) glow around the notch while the battery is low.
+struct BatteryRim: View {
+    let shape: UnevenRoundedRectangle
+    let color: Color
+
+    var body: some View {
+        shape
+            .stroke(color.opacity(0.9), lineWidth: 1)
+            .background(shape.stroke(color.opacity(0.55), lineWidth: 3).blur(radius: 4))
+            .allowsHitTesting(false)
+    }
+}
+
+/// Icons of the apps using the camera or mic, overlapped; a plain symbol if the app isn't known.
+struct SensorAppIcons: View {
+    let apps: [SensorApp]
+    let camera: Bool
+
+    var body: some View {
+        HStack(spacing: -6) {
+            if apps.isEmpty {
+                Image(systemName: camera ? "video.fill" : "mic.fill")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(camera ? Color.green : Color.orange)
+            } else {
+                ForEach(apps.prefix(2)) { app in
+                    if let icon = app.icon {
+                        Image(nsImage: icon)
+                            .resizable()
+                            .frame(width: 18, height: 18)
+                            .help(app.name)
+                    }
+                }
+            }
+        }
+        .frame(width: 24, alignment: .leading)
+    }
+}
+
+struct SensorDot: View {
+    let color: Color
+
+    var body: some View {
+        Circle()
+            .fill(color)
+            .frame(width: 7, height: 7)
+            .shadow(color: color.opacity(0.7), radius: 3)
     }
 }
 
@@ -263,13 +358,62 @@ struct NotchSurface: View {
 
 // MARK: - Layout
 
-struct ExpandedView: View {
+/// Now Playing, flipping to the per-app volume mixer with the speaker button.
+struct LeftCard: View {
+    @AppStorage("showMixer") private var showMixer = false
+
     var body: some View {
-        HStack(alignment: .top, spacing: 12) {
-            NowPlayingCard().frame(width: 272)
-            ClipboardCard().frame(maxWidth: .infinity)
-            ShortcutsCard().frame(width: 136)
+        ZStack {
+            if showMixer {
+                MixerCard().transition(.blurReplace)
+            } else {
+                NowPlayingCard().transition(.blurReplace)
+            }
         }
+        .overlay(alignment: .topTrailing) {
+            Button {
+                withAnimation(.spring(duration: 0.35, bounce: 0.1)) { showMixer.toggle() }
+            } label: {
+                Image(systemName: showMixer ? "music.note" : "slider.horizontal.3")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.55))
+                    .frame(width: 22, height: 22)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(HoverButtonStyle(radius: 6))
+            .padding(7)
+            .help(showMixer ? "Show Now Playing" : "Per-app volume")
+        }
+    }
+}
+
+struct ExpandedView: View {
+    @EnvironmentObject var appContext: AppContextMonitor
+    @EnvironmentObject var downloads: DownloadsTidier
+    let cardsHeight: CGFloat
+
+    var body: some View {
+        VStack(spacing: 12) {
+            HStack(alignment: .top, spacing: 12) {
+                LeftCard().frame(width: 272)
+                ClipboardCard().frame(maxWidth: .infinity)
+                ShortcutsCard().frame(width: 136)
+            }
+            .frame(height: cardsHeight)
+
+            // The app in front takes the strip; leftover installers show when nothing else needs it.
+            if appContext.hasStrip {
+                ContextStrip()
+                    .frame(height: NotchState.contextStripHeight - 12)
+                    .transition(.opacity.combined(with: .move(edge: .bottom)))
+            } else if downloads.hasLeftovers {
+                LeftoversStrip()
+                    .frame(height: NotchState.contextStripHeight - 12)
+                    .transition(.opacity.combined(with: .move(edge: .bottom)))
+            }
+        }
+        .animation(.spring(duration: 0.45, bounce: 0.15), value: appContext.hasStrip)
+        .animation(.spring(duration: 0.45, bounce: 0.15), value: downloads.hasLeftovers)
     }
 }
 
@@ -371,19 +515,31 @@ struct ArtworkView: View {
 }
 
 struct EqualizerView: View {
+    @EnvironmentObject var music: MusicController
+    @EnvironmentObject var visualizer: AudioVisualizer
+
     var body: some View {
         TimelineView(.animation(minimumInterval: 1 / 30)) { context in
             let t = context.date.timeIntervalSinceReferenceDate
             HStack(alignment: .center, spacing: 2) {
-                ForEach(0..<4, id: \.self) { i in
-                    let phase = t * (3.2 + Double(i) * 0.9) + Double(i) * 1.7
+                ForEach(0..<BandLevels.count, id: \.self) { i in
                     Capsule()
-                        .frame(width: 2.5, height: 4 + 9 * (0.5 + 0.5 * sin(phase)))
+                        .frame(width: 2.5, height: 3 + 11 * level(i, at: t))
                 }
             }
             .frame(width: 20, height: 14)
             .foregroundStyle(Palette.sky)
         }
+        .onAppear { visualizer.start(for: music.player) }
+        .onDisappear { visualizer.stop() }
+        .onChange(of: music.player) { visualizer.playerChanged(music.player) }
+    }
+
+    /// Real band level when the audio tap is live; a gentle idle animation otherwise.
+    private func level(_ i: Int, at t: Double) -> Double {
+        if visualizer.isLive { return Double(visualizer.bands.values[i]) }
+        let phase = t * (3.2 + Double(i) * 0.9) + Double(i) * 1.7
+        return 0.5 + 0.5 * sin(phase)
     }
 }
 
@@ -686,10 +842,23 @@ struct ClipboardCard: View {
 // MARK: - Shortcuts
 
 struct ShortcutsCard: View {
+    @EnvironmentObject var glassDock: GlassDockController
+
     var body: some View {
         GlassCard(
             title: "Shortcuts",
-            accessory: AnyView(
+            accessory: AnyView(HStack(spacing: 2) {
+                if glassDock.isInstalled {
+                    Button { glassDock.toggle() } label: {
+                        Image(systemName: glassDock.enabled ? "dock.rectangle" : "dock.arrow.down.rectangle")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(glassDock.enabled ? Palette.sky : Palette.tertiary)
+                            .frame(width: 18, height: 18)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(HoverButtonStyle(radius: 5))
+                    .help(glassDock.enabled ? "GlassDock is on. Click to go back to the normal Dock" : "Turn on GlassDock")
+                }
                 Button { NSApp.terminate(nil) } label: {
                     Image(systemName: "power")
                         .font(.system(size: 10, weight: .semibold))
@@ -699,16 +868,14 @@ struct ShortcutsCard: View {
                 .buttonStyle(HoverButtonStyle(radius: 5))
                 .foregroundStyle(Palette.tertiary)
                 .help("Quit NotchHub (starts again at next login)")
-            )
+            })
         ) {
-            GlassEffectContainer(spacing: 5) {
-                VStack(spacing: 5) {
-                    ForEach(QuickLinks.all) { link in
+            VStack(spacing: 5) {
+                ForEach(QuickLinks.all) { link in
                     shortcut(link.name, symbol: link.symbol) { NSWorkspace.shared.open(link.url) }
                 }
-                    shortcut("Claude", symbol: "sparkles") { ClaudeShortcuts.openApp() }
-                    RecordButton()
-                }
+                shortcut("Claude", symbol: "sparkles") { ClaudeShortcuts.openApp() }
+                RecordButton()
             }
         }
     }
@@ -728,9 +895,8 @@ struct ShortcutsCard: View {
             }
             .padding(4)
             .contentShape(Rectangle())
-            .glassEffect(.regular.interactive(), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
         }
-        .buttonStyle(.plain)
+        .buttonStyle(HoverButtonStyle(radius: 10, idle: Color.white.opacity(0.06)))
     }
 }
 
@@ -773,12 +939,11 @@ struct RecordButton: View {
             }
             .padding(4)
             .contentShape(Rectangle())
-            .glassEffect(
-                recorder.isRecording ? .regular.tint(.red.opacity(0.35)).interactive() : .regular.interactive(),
-                in: RoundedRectangle(cornerRadius: 10, style: .continuous)
-            )
         }
-        .buttonStyle(.plain)
+        .buttonStyle(HoverButtonStyle(
+            radius: 10,
+            idle: recorder.isRecording ? Color.red.opacity(0.25) : Color.white.opacity(0.06)
+        ))
         .help(recorder.isRecording ? "Stop recording" : "Record the screen with system audio to ~/Movies/NotchHub")
         .animation(.spring(duration: 0.3, bounce: 0.2), value: recorder.phase)
     }

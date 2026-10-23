@@ -242,8 +242,10 @@ final class DockModel: ObservableObject {
         var found: [String: String] = [:]
         for list in Self.children(AXUIElementCreateApplication(dock.processIdentifier)) {
             for item in Self.children(list) {
-                guard let title = Self.string(item, kAXTitleAttribute),
-                      let label = Self.string(item, "AXStatusLabel"), !label.isEmpty
+                // Only real app tiles: the Dock also has Handoff, folder and Bin items with their own status text.
+                guard Self.string(item, kAXSubroleAttribute) == "AXApplicationDockItem",
+                      let title = Self.string(item, kAXTitleAttribute),
+                      let label = Self.string(item, "AXStatusLabel"), Self.looksLikeBadge(label)
                 else { continue }
                 found[title] = label
             }
@@ -252,6 +254,13 @@ final class DockModel: ObservableObject {
             badges = found
             rebuild()
         }
+    }
+
+    /// Badges are short: counts ("3", "1,204", "99+"), a dot or "!". Anything longer is an internal status string.
+    private static func looksLikeBadge(_ label: String) -> Bool {
+        let trimmed = label.trimmingCharacters(in: .whitespaces)
+        return !trimmed.isEmpty && trimmed.count <= 6 && !trimmed.contains(".")
+            || trimmed.allSatisfy { $0.isNumber || $0 == "," || $0 == "+" } && !trimmed.isEmpty
     }
 
     private static func children(_ element: AXUIElement) -> [AXUIElement] {

@@ -8,6 +8,8 @@ struct WindowThumbnail: Identifiable {
     let title: String
     let image: NSImage
     let pid: pid_t
+    /// The window's frame in top-left global coordinates (valid on any desktop).
+    let frame: CGRect
 }
 
 /// Live window previews for the hovered app, captured on demand (nothing runs when no preview is showing).
@@ -86,7 +88,8 @@ final class PreviewModel: ObservableObject {
                         id: window.windowID,
                         title: window.title ?? "",
                         image: NSImage(cgImage: image, size: NSSize(width: window.frame.width * scale, height: window.frame.height * scale)),
-                        pid: window.owningApplication?.processID ?? 0
+                        pid: window.owningApplication?.processID ?? 0,
+                        frame: window.frame
                     ))
                 }
             }
@@ -96,23 +99,43 @@ final class PreviewModel: ObservableObject {
         }
     }
 
+    /// Where a dragged file is over a card: card ID and point in that card's thumbnail (top-left, points).
+    @Published var dragMarker: (id: CGWindowID, point: CGPoint)?
+    var dragIcon: NSImage?
+    /// Each thumbnail image's frame in the overlay's top-left coordinates (not published).
+    var imageFrames: [CGWindowID: CGRect] = [:]
+
+    /// Called after a drag springs a window open, so the dock can get out of the way.
+    var onSpringLoaded: (() -> Void)?
+
     /// Brings one specific window to the front.
     func focus(_ thumbnail: WindowThumbnail) {
-        NSRunningApplication(processIdentifier: thumbnail.pid)?.activate()
-        let app = AXUIElementCreateApplication(thumbnail.pid)
-        var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value) == .success,
-              let windows = value as? [AXUIElement]
-        else { return }
-        for window in windows {
-            var title: CFTypeRef?
-            AXUIElementCopyAttributeValue(window, kAXTitleAttribute as CFString, &title)
-            if (title as? String ?? "") == thumbnail.title {
-                AXUIElementPerformAction(window, kAXRaiseAction as CFString)
-                AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue)
-                break
-            }
-        }
+        WindowFocus.focus(windowID: thumbnail.id, pid: thumbnail.pid, title: thumbnail.title)
         hide()
     }
+
+    /// Spring-loading: while a file is dragged over a preview, bring that window forward and move the cursor to
+    /// the matching spot in it (`fraction` is the drag position within the thumbnail, 0…1 from the top left),
+    /// so the user's own release drops the file exactly where they aimed.
+    func springLoad(_ thumbnail: WindowThumbnail, at fraction: CGPoint) {
+        WindowFocus.focus(windowID: thumbnail.id, pid: thumbnail.pid, title: thumbnail.title)
+        let frame = thumbnail.frame
+        let target = CGPoint(
+            x: frame.minX + frame.width * min(max(fraction.x, 0.02), 0.98),
+            y: frame.minY + frame.height * min(max(fraction.y, 0.02), 0.98)
+        )
+        hide()
+        onSpringLoaded?()
+        // Accessibility and CoreGraphics share top-left global coordinates.
+        CGWarpMouseCursorPosition(target)
+        CGAssociateMouseAndMouseCursorPosition(1)
+    }
+
+    /// Files dropped straight onto a card (before it springs) open in that app.
+    func openDropped(_ urls: [URL], in thumbnail: WindowThumbnail) {
+        guard let app = NSRunningApplication(processIdentifier: thumbnail.pid)?.bundleURL else { return }
+        NSWorkspace.shared.open(urls, withApplicationAt: app, configuration: NSWorkspace.OpenConfiguration())
+        hide()
+    }
+
 }

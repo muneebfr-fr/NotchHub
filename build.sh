@@ -10,15 +10,6 @@ cp Info.plist "$APP/Contents/"
 codesign --force --sign - "$APP"
 echo "Built $APP"
 
-# GlassDock is a separate app in this repo; rebuild it only when its sources changed (its rebuild resets
-# its permissions, so skipping unchanged builds avoids needless prompts).
-GLASSDOCK=GlassDock/build/GlassDock.app/Contents/MacOS/GlassDock
-if [ ! -f "$GLASSDOCK" ] || [ -n "$(find GlassDock/Sources GlassDock/Package.swift GlassDock/Info.plist -newer "$GLASSDOCK" 2>/dev/null)" ]; then
-    ./GlassDock/build.sh
-    # A running GlassDock is restarted on the new build by NotchHub's watchdog.
-    pkill -x GlassDock || true
-fi
-
 # A rebuild changes the app's signature, which silently invalidates its old permission entries.
 # Clearing them lets the relaunched app show fresh permission prompts.
 tccutil reset Accessibility local.notchhub
@@ -27,3 +18,14 @@ tccutil reset AudioCapture local.notchhub || true
 pkill -x NotchHub || true
 sleep 0.5
 open "$APP"
+
+# GlassDock and Edge Shelf are separate apps in this repo; each is rebuilt only when its sources changed
+# (a rebuild resets its permissions, so skipping unchanged builds avoids needless prompts). A running one is
+# restarted on the new build by NotchHub's watchdog.
+for APPNAME in GlassDock EdgeShelf; do
+    BIN="$APPNAME/build/$APPNAME.app/Contents/MacOS/$APPNAME"
+    if [ ! -f "$BIN" ] || [ -n "$(find "$APPNAME/Sources" "$APPNAME/Package.swift" "$APPNAME/Info.plist" -newer "$BIN" 2>/dev/null)" ]; then
+        "./$APPNAME/build.sh"
+        pkill -x "$APPNAME" || true
+    fi
+done

@@ -37,7 +37,8 @@ struct NotchView: View {
 
     // Most important first: our own recording, then who's using the camera/mic, then charging, then music.
     private var wingMode: WingMode {
-        guard !state.expanded else { return .none }
+        // Waits until the panel has fully closed (glass off), so indicators never overlap the closing cards.
+        guard !state.expanded, !state.glassOn else { return .none }
         if recorder.isRecording { return .recording }
         if sensors.isActive { return .sensors(camera: sensors.cameraOn, mic: sensors.micOn, apps: sensors.apps.map(\.id)) }
         if case .needsInput = claudeCode.status { return .claude(claudeCode.status) }
@@ -68,7 +69,7 @@ struct NotchView: View {
             // Drawn first so the black notch covers the hidden glass seed the HUD morphs out of.
             hudGlass
 
-            NotchSurface(expanded: state.expanded, notchHeight: state.notchSize.height, shape: shape)
+            NotchSurface(expanded: state.expanded, glassOn: state.glassOn, notchHeight: state.notchSize.height, shape: shape)
                 .frame(width: size.width, height: size.height)
 
             if power.batteryAlert != .none {
@@ -99,7 +100,8 @@ struct NotchView: View {
                             active: SoftReveal(progress: 0),
                             identity: SoftReveal(progress: 1)
                         ).animation(.spring(duration: 0.5, bounce: 0.1).delay(0.08)),
-                        removal: .opacity.animation(.easeOut(duration: 0.12))
+                        // Contents leave first and fast, before the panel shrinks around them.
+                        removal: .opacity.animation(.easeOut(duration: 0.05))
                     ))
             } else if wingMode != .none {
                 wings
@@ -332,6 +334,9 @@ struct SoftReveal: ViewModifier {
 /// Black while collapsed so it matches the physical notch; native Liquid Glass once open.
 struct NotchSurface: View {
     let expanded: Bool
+    /// Glass stays on until the panel has fully shrunk back into the notch, so closing never shows a
+    /// see-through dark box with the contents fading inside it.
+    let glassOn: Bool
     let notchHeight: CGFloat
     let shape: UnevenRoundedRectangle
 
@@ -352,7 +357,7 @@ struct NotchSurface: View {
                 .opacity(expanded ? 1 : 0)
             }
             .clipShape(shape)
-            .glassEffect(expanded ? .regular : .identity, in: shape)
+            .glassEffect(glassOn ? .regular : .identity, in: shape)
     }
 }
 
@@ -592,6 +597,8 @@ struct NowPlayingCard: View {
                 .frame(width: 38, height: 38)
                 .contentShape(Circle())
                 .glassEffect(.regular.interactive(), in: Circle())
+                // Leaves together with the card instead of running its own glass dematerialise animation.
+                .glassEffectTransition(.identity)
         }
         .buttonStyle(.plain)
     }
@@ -841,24 +848,54 @@ struct ClipboardCard: View {
 
 // MARK: - Shortcuts
 
+/// Holds the companion-app toggles so each one's button updates on its own.
+@MainActor
+final class CompanionApps: ObservableObject {
+    let glassDock: CompanionApp
+    let edgeShelf: CompanionApp
+    init(glassDock: CompanionApp, edgeShelf: CompanionApp) {
+        self.glassDock = glassDock
+        self.edgeShelf = edgeShelf
+    }
+}
+
+private struct CompanionToggle: View {
+    @ObservedObject var app: CompanionApp
+    let onSymbol: String
+    let offSymbol: String
+    let onHelp: String
+    let offHelp: String
+
+    var body: some View {
+        if app.isInstalled {
+            Button { app.toggle() } label: {
+                Image(systemName: app.enabled ? onSymbol : offSymbol)
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(app.enabled ? Palette.sky : Palette.tertiary)
+                    .frame(width: 18, height: 18)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(HoverButtonStyle(radius: 5))
+            .help(app.enabled ? onHelp : offHelp)
+        }
+    }
+}
+
 struct ShortcutsCard: View {
-    @EnvironmentObject var glassDock: GlassDockController
+    @EnvironmentObject var companions: CompanionApps
 
     var body: some View {
         GlassCard(
             title: "Shortcuts",
             accessory: AnyView(HStack(spacing: 2) {
-                if glassDock.isInstalled {
-                    Button { glassDock.toggle() } label: {
-                        Image(systemName: glassDock.enabled ? "dock.rectangle" : "dock.arrow.down.rectangle")
-                            .font(.system(size: 10, weight: .semibold))
-                            .foregroundStyle(glassDock.enabled ? Palette.sky : Palette.tertiary)
-                            .frame(width: 18, height: 18)
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(HoverButtonStyle(radius: 5))
-                    .help(glassDock.enabled ? "GlassDock is on. Click to go back to the normal Dock" : "Turn on GlassDock")
-                }
+                CompanionToggle(
+                    app: companions.edgeShelf, onSymbol: "sidebar.right", offSymbol: "sidebar.squares.right",
+                    onHelp: "Edge Shelf is on. Click to turn it off", offHelp: "Turn on Edge Shelf"
+                )
+                CompanionToggle(
+                    app: companions.glassDock, onSymbol: "dock.rectangle", offSymbol: "dock.arrow.down.rectangle",
+                    onHelp: "GlassDock is on. Click to go back to the normal Dock", offHelp: "Turn on GlassDock"
+                )
                 Button { NSApp.terminate(nil) } label: {
                     Image(systemName: "power")
                         .font(.system(size: 10, weight: .semibold))

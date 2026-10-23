@@ -26,6 +26,7 @@ final class NotchState: ObservableObject {
     /// Taller than the panel so cards that drop below the notch (e.g. a local add-on's answer card) have room.
     static let windowSize = CGSize(width: 680, height: 520)
     @Published var expanded = false
+    @Published var glassOn = false
     @Published var notchSize = CGSize(width: 200, height: 32)
 }
 
@@ -50,7 +51,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let downloads = DownloadsTidier()
     private let mixer = VolumeMixer()
     private let visualizer = AudioVisualizer()
-    private let glassDock = GlassDockController()
+    private let glassDock = CompanionApp.glassDock()
+    private let edgeShelf = CompanionApp.edgeShelf()
     private lazy var extensionHost = LocalExtensionHost(state: state)
     private var localExtension: LocalExtension?
     private var extensionIsInteractive = false
@@ -81,25 +83,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         localExtension = LocalExtensions.load(host: extensionHost)
 
-        let host = NSHostingView(
-            rootView: NotchView(localOverlay: localExtension?.overlay)
-                .environmentObject(state)
-                .environmentObject(clipboard)
-                .environmentObject(music)
-                .environmentObject(hud)
-                .environmentObject(recorder)
-                .environmentObject(power)
-                .environmentObject(sensors)
-                .environmentObject(claudeCode)
-                .environmentObject(appContext)
-                .environmentObject(downloads)
-                .environmentObject(mixer)
-                .environmentObject(visualizer)
-                .environmentObject(glassDock)
-        )
-        // The window has a fixed size, so skip SwiftUI's per-layout window size negotiation.
-        host.sizingOptions = []
-        panel.contentView = host
+        panel.contentView = makeHost()
 
         // Notch pet (parked, see NotchPet.swift):
         // let petHost = NSHostingView(rootView: PetLayer().environmentObject(state).environmentObject(music))
@@ -149,6 +133,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         return false
+    }
+
+    private lazy var companions = CompanionApps(glassDock: glassDock, edgeShelf: edgeShelf)
+
+    private func makeHost() -> NSView {
+        let host = NSHostingView(
+            rootView: NotchView(localOverlay: localExtension?.overlay)
+                .environmentObject(state)
+                .environmentObject(clipboard)
+                .environmentObject(music)
+                .environmentObject(hud)
+                .environmentObject(recorder)
+                .environmentObject(power)
+                .environmentObject(sensors)
+                .environmentObject(claudeCode)
+                .environmentObject(appContext)
+                .environmentObject(downloads)
+                .environmentObject(mixer)
+                .environmentObject(visualizer)
+                .environmentObject(companions)
+        )
+        // The window has a fixed size, so skip SwiftUI's per-layout window size negotiation.
+        host.sizingOptions = []
+        return host
     }
 
     // Re-registering every launch means quitting only stops the current session.
@@ -247,10 +255,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let animation: Animation = expanded
             ? .spring(duration: 0.55, bounce: 0.18)
             : .spring(duration: 0.38, bounce: 0)
+        if expanded { state.glassOn = true }
         withAnimation(animation) {
             state.expanded = expanded
         }
         panel.ignoresMouseEvents = !expanded
+        if !expanded {
+            // Glass switches off only once the panel has finished shrinking into the (black) notch.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+                MainActor.assumeIsolated {
+                    guard let self, !self.state.expanded else { return }
+                    self.state.glassOn = false
+                }
+            }
+        }
     }
 
     /// Gives an add-on clicks and keyboard focus without activating NotchHub, then hands focus back afterwards.

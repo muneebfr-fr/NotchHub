@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import CoreImage
 import QuartzCore
 
 /// The dock itself, drawn with Core Animation layers that are positioned by hand on every display refresh,
@@ -10,71 +11,105 @@ final class DockStrip: NSView {
     enum Item: Equatable {
         case app(DockApp)
         case separator(Int)
+        case downloads
+        case minimized(MinimizedWindow)
         case trash(full: Bool)
 
         var id: String {
             switch self {
             case .app(let app): app.id
             case .separator(let n): "separator-\(n)"
+            case .downloads: "downloads"
+            case .minimized(let window): "min-\(window.id)"
             case .trash: "trash"
             }
         }
         var isSeparator: Bool { if case .separator = self { true } else { false } }
         var app: DockApp? { if case .app(let app) = self { app } else { nil } }
+        var displayName: String {
+            switch self {
+            case .app(let app): app.name
+            case .downloads: "Downloads"
+            case .minimized(let window): window.title
+            case .trash: "Bin"
+            case .separator: ""
+            }
+        }
     }
 
-    /// Called when the icon under the cursor changes (drives previews and name tags).
+    /// Called when the icon under the cursor changes (drives previews).
     var onHoverChange: ((Item?) -> Void)?
+    /// Called when a non-app item is clicked (Downloads stack, minimised window).
+    var onActivate: ((Item) -> Void)?
+    /// Builds the right-click menu for an item.
+    var menuProvider: ((Item) -> NSMenu?)?
     /// Freezes the magnification while previews are open so the cards don't slide away.
     var holdsShape = false
+    var reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
 
     private let model: DockModel
+    private let extras: DockExtras
     private let glass = NSGlassEffectView()
     private let iconHost = NSView()
+    private let nameTag = NameTagView()
     private var items: [Item] = []
     private var layers: [String: IconLayer] = [:]
-    private let nameTag = NameTagLayer()
     private var cancellables: Set<AnyCancellable> = []
 
+    // Proportions of the macOS 26 Dock, relative to the tile size.
     private var base: CGFloat { model.tileSize }
-    private var peak: CGFloat { model.largeSize / model.tileSize }
-    private let padding: CGFloat = 5
-    private let spacing: CGFloat = 3
-    private let separatorWidth: CGFloat = 14
-    private let bottomInset: CGFloat = 4
-    var barHeight: CGFloat { base + padding * 2 + 4 }
+    private var peak: CGFloat { model.magnifies ? model.largeSize / model.tileSize : 1 }
+    private var spacing: CGFloat { (base * 0.12).rounded() }
+    private var sidePadding: CGFloat { (base * 0.26).rounded() }
+    private var verticalPadding: CGFloat { (base * 0.2).rounded() }
+    private var separatorWidth: CGFloat { (base * 0.4).rounded() }
+    let bottomInset: CGFloat = 4
+    var barHeight: CGFloat { base + verticalPadding * 2 }
 
     // Animation state
     private var cursorX: CGFloat?
     private var scales: [CGFloat] = []
     private var displayLink: CADisplayLink?
     private var lastTimestamp: CFTimeInterval = 0
-    /// When the cursor entered the dock; magnification eases in briefly, then tracks the cursor exactly.
     private var enteredAt: CFTimeInterval?
+    /// Leaving the dock: magnification relaxes along a timed ease-out from these scales.
+    private var relaxFrom: [CGFloat]?
+    private var relaxStart: CFTimeInterval = 0
+    private static let relaxDuration: CFTimeInterval = 0.32
     private(set) var hovered: String?
     private(set) var dockFrame: CGRect = .zero
+    private var scale: CGFloat { window?.backingScaleFactor ?? 2 }
 
-    // Dragging
+    // Launch bounce: when each app started bouncing; a stopping app finishes its current hop.
+    private var bounceStarts: [String: CFTimeInterval] = [:]
+    private var bounceStops: [String: CFTimeInterval] = [:]
+    private static let hopDuration: CFTimeInterval = 0.62
+
+    // Press and drag
     private var pressedItem: Item?
     private var pressPoint: CGPoint?
     private var draggingID: String?
-    private var dragX: CGFloat = 0
+    private var dragPoint: CGPoint = .zero
+    private var shownX: [String: CGFloat] = [:]
+    private var reorderSettleUntil: CFTimeInterval = 0
 
-    init(model: DockModel) {
+    init(model: DockModel, extras: DockExtras) {
         self.model = model
+        self.extras = extras
         super.init(frame: .zero)
         wantsLayer = true
-        glass.cornerRadius = 20
+        glass.style = .regular
         addSubview(glass)
         iconHost.wantsLayer = true
+        iconHost.layerUsesCoreImageFilters = true
         addSubview(iconHost)
-        iconHost.layer?.addSublayer(nameTag)
+        addSubview(nameTag)
         registerForDraggedTypes([.fileURL])
 
-        Publishers.CombineLatest3(model.$pinned, model.$others, model.$trashFull)
+        Publishers.CombineLatest4(model.$pinned, model.$others, model.$trashFull, extras.$minimized)
             .receive(on: RunLoop.main)
-            .sink { [weak self] pinned, others, full in
-                MainActor.assumeIsolated { self?.setItems(pinned: pinned, others: others, trashFull: full) }
+            .sink { [weak self] pinned, others, full, minimized in
+                MainActor.assumeIsolated { self?.setItems(pinned: pinned, others: others, trashFull: full, minimized: minimized) }
             }
             .store(in: &cancellables)
     }
@@ -92,38 +127,52 @@ final class DockStrip: NSView {
 
     override func viewDidChangeBackingProperties() {
         super.viewDidChangeBackingProperties()
-        let scale = window?.backingScaleFactor ?? 2
-        layers.values.forEach { $0.setScale(scale) }
-        nameTag.contentsScale = scale
-        nameTag.text.contentsScale = scale
+        layers.values.forEach { $0.contentsScaleChanged(scale) }
+        render()
     }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        let dark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        layers.values.forEach { $0.setDark(dark) }
+    }
+
+    private var isDark: Bool { effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua }
 
     // MARK: Items
 
-    private func setItems(pinned: [DockApp], others: [DockApp], trashFull: Bool) {
+    private func setItems(pinned: [DockApp], others: [DockApp], trashFull: Bool, minimized: [MinimizedWindow]) {
         var new = pinned.map(Item.app)
         if !others.isEmpty {
             new.append(.separator(0))
             new += others.map(Item.app)
         }
         new.append(.separator(1))
+        new.append(.downloads)
+        new += minimized.map(Item.minimized)
         new.append(.trash(full: trashFull))
 
         let ids = Set(new.map(\.id))
         for (id, layer) in layers where !ids.contains(id) {
             layer.removeFromSuperlayer()
             layers[id] = nil
+            bounceStarts[id] = nil
         }
-        let scale = window?.backingScaleFactor ?? 2
         for item in new {
             let layer = layers[item.id] ?? {
                 let layer = IconLayer()
-                layer.setScale(scale)
-                iconHost.layer?.insertSublayer(layer, below: nameTag)
+                layer.tileSize = base
+                layer.largeTile = base * peak
+                layer.contentsScaleChanged(scale)
+                layer.setDark(isDark)
+                iconHost.layer?.addSublayer(layer)
                 layers[item.id] = layer
                 return layer
             }()
-            layer.configure(item, tile: base)
+            layer.configure(item)
+            if let app = item.app {
+                if app.launching, bounceStarts[app.id] == nil { bounceStarts[app.id] = CACurrentMediaTime() }
+            }
         }
         // Keep current magnification for surviving items so a launch doesn't snap the dock.
         let old = Dictionary(uniqueKeysWithValues: zip(items.map(\.id), scales))
@@ -137,13 +186,14 @@ final class DockStrip: NSView {
     func cursorMoved(toScreen point: CGPoint) {
         guard let window else { return }
         let local = convert(window.convertPoint(fromScreen: point), from: nil)
-        let band = CGRect(x: dockFrame.minX - 8, y: 0, width: dockFrame.width + 16, height: bottomInset + barHeight + base * (peak - 1) + 6)
+        let band = CGRect(x: dockFrame.minX - 8, y: 0, width: dockFrame.width + 16,
+                          height: bottomInset + barHeight + base * (peak - 1) + 6)
         if band.contains(local) || draggingID != nil {
             if cursorX == nil { enteredAt = CACurrentMediaTime() }
             cursorX = local.x
+            relaxFrom = nil
         } else if !holdsShape {
-            cursorX = nil
-            enteredAt = nil
+            beginRelax()
         }
         // Once settled in, redraw immediately on every mouse event instead of waiting for the next frame tick.
         if isTracking {
@@ -155,15 +205,22 @@ final class DockStrip: NSView {
     }
 
     private var isTracking: Bool {
-        guard cursorX != nil, let enteredAt, draggingID == nil else { return false }
+        guard cursorX != nil, let enteredAt, draggingID == nil, bounceStarts.isEmpty else { return false }
         return CACurrentMediaTime() - enteredAt > 0.12
     }
 
     func cursorLeft() {
         guard !holdsShape else { return }
+        beginRelax()
+        startAnimating()
+    }
+
+    private func beginRelax() {
+        guard cursorX != nil else { return }
         cursorX = nil
         enteredAt = nil
-        startAnimating()
+        relaxFrom = scales
+        relaxStart = CACurrentMediaTime()
     }
 
     // MARK: Frame loop
@@ -180,20 +237,25 @@ final class DockStrip: NSView {
         let dt = lastTimestamp == 0 ? 1.0 / 120 : min(1.0 / 30, link.targetTimestamp - lastTimestamp)
         lastTimestamp = link.targetTimestamp
 
-        let target = targetScales()
-        // Follows the cursor almost immediately while hovering; relaxes more gently when it leaves.
-        let rate: Double = cursorX == nil ? 16 : 30
-        let k = isTracking ? 1 : CGFloat(1 - exp(-rate * dt))
         var settled = true
-        for i in scales.indices {
-            let next = scales[i] + (target[i] - scales[i]) * k
-            if abs(next - target[i]) > 0.002 { settled = false }
-            scales[i] = abs(next - target[i]) > 0.002 ? next : target[i]
+        if let from = relaxFrom, from.count == scales.count {
+            // A smooth ease-out back to rest, the same length however magnified the dock was.
+            let p = min(1, (link.targetTimestamp - relaxStart) / Self.relaxDuration)
+            let eased = CGFloat(1 - pow(1 - p, 3))
+            for i in scales.indices { scales[i] = from[i] + (1 - from[i]) * eased }
+            if p < 1 { settled = false } else { relaxFrom = nil }
+        } else {
+            let target = targetScales()
+            let k = isTracking ? 1 : CGFloat(1 - exp(-30 * dt))
+            for i in scales.indices {
+                let next = scales[i] + (target[i] - scales[i]) * k
+                if abs(next - target[i]) > 0.002 { settled = false }
+                scales[i] = abs(next - target[i]) > 0.002 ? next : target[i]
+            }
         }
-        let bouncing = items.contains { $0.app?.launching == true }
-        render(time: link.targetTimestamp)
+        let positionsSettled = render(time: link.targetTimestamp, dt: dt)
 
-        if settled && !bouncing && draggingID == nil {
+        if settled && positionsSettled && bounceStarts.isEmpty && draggingID == nil {
             link.invalidate()
             displayLink = nil
         }
@@ -201,103 +263,187 @@ final class DockStrip: NSView {
 
     // MARK: Layout
 
-    private func restWidths() -> [CGFloat] { items.map { $0.isSeparator ? separatorWidth : base } }
+    private func restWidth(_ item: Item) -> CGFloat { item.isSeparator ? separatorWidth : base }
 
-    private func positions(for scales: [CGFloat]) -> (centers: [CGFloat], width: CGFloat) {
-        let widths = restWidths()
+    /// The native magnification shape: a raised cosine about three icons wide, flat near its peak.
+    private func magnification(around u: CGFloat?, restCenters: [CGFloat]) -> [CGFloat] {
+        let reach = base * 3
+        return items.indices.map { i in
+            guard peak > 1, let u, !items[i].isSeparator else { return 1 }
+            let d = abs(restCenters[i] - u)
+            guard d < reach else { return 1 }
+            return 1 + (peak - 1) * (1 + cos(.pi * d / reach)) / 2
+        }
+    }
+
+    private func restLayout() -> (centers: [CGFloat], starts: [CGFloat], width: CGFloat) {
+        var x = sidePadding
         var centers: [CGFloat] = []
-        var x = padding
-        for i in items.indices {
-            let w = widths[i] * scales[i]
+        var starts: [CGFloat] = []
+        for item in items {
+            let w = restWidth(item)
+            starts.append(x)
             centers.append(x + w / 2)
             x += w + spacing
         }
-        return (centers, x - spacing + padding)
+        return (centers, starts, x - spacing + sidePadding)
     }
 
-    private func gaussian(around u: CGFloat?) -> [CGFloat] {
-        let widths = restWidths()
-        var x = padding
-        let restCenters = widths.map { w -> CGFloat in defer { x += w + spacing }; return x + w / 2 }
-        let sigma = base * 1.25
-        return items.indices.map { i in
-            guard model.magnifies, let u, !items[i].isSeparator else { return 1 }
-            let d = restCenters[i] - u
-            return 1 + (peak - 1) * exp(-(d * d) / (2 * sigma * sigma))
+    private func positions(for scales: [CGFloat], order: [Int]) -> (centers: [Int: CGFloat], width: CGFloat) {
+        var centers: [Int: CGFloat] = [:]
+        var x = sidePadding
+        for i in order {
+            let w = items[i].id == gapMarker ? base : restWidth(items[i]) * scales[i]
+            centers[i] = x + w / 2
+            x += w + spacing
         }
+        return (centers, x - spacing + sidePadding)
     }
 
-    /// Scales for the cursor's position: solves for the resting point that lands under the cursor once the
-    /// dock has grown and re-centred, so the icon under the cursor stays under it.
+    private let gapMarker = "__gap__"
+
+    /// Solves for the resting point that lands under the cursor once the dock has grown and re-centred.
     private func targetScales() -> [CGFloat] {
         guard let cursorX, !items.isEmpty else { return items.map { _ in 1 } }
-        let widths = restWidths()
-        var x = padding
-        let restStarts = widths.map { w -> CGFloat in defer { x += w + spacing }; return x }
-        let restWidth = x - spacing + padding
-        var u = cursorX - (bounds.width - restWidth) / 2
-        var result = gaussian(around: u)
+        let rest = restLayout()
+        var u = cursorX - (bounds.width - rest.width) / 2
+        var result = magnification(around: u, restCenters: rest.centers)
+        let order = Array(items.indices)
         for _ in 0..<4 {
-            let (centers, width) = positions(for: result)
+            let (centers, width) = positions(for: result, order: order)
             let left = (bounds.width - width) / 2
-            let k = restStarts.lastIndex { $0 <= u } ?? 0
-            let scaledStart = centers[k] - widths[k] * result[k] / 2
-            let landed = left + scaledStart + (u - restStarts[k]) * result[k]
+            let k = rest.starts.lastIndex { $0 <= u } ?? 0
+            let scaledStart = centers[k, default: 0] - restWidth(items[k]) * result[k] / 2
+            let landed = left + scaledStart + (u - rest.starts[k]) * result[k]
             u += (cursorX - landed) / max(result[k], 1)
-            result = gaussian(around: u)
+            result = magnification(around: u, restCenters: rest.centers)
         }
         return result
     }
 
-    private func render(time: CFTimeInterval = CACurrentMediaTime()) {
-        guard !items.isEmpty, scales.count == items.count else { return }
-        let (centers, width) = positions(for: scales)
-        let left = ((bounds.width - width) / 2).rounded()
-        dockFrame = CGRect(x: left, y: bottomInset, width: width, height: barHeight)
+    /// Order of items while one is being dragged: the dragged icon leaves a gap where it would land.
+    private func dragOrder(left: CGFloat) -> (order: [Int], gapIndex: Int?) {
+        guard let draggingID, let dragged = items.firstIndex(where: { $0.id == draggingID }),
+              items[dragged].app?.pinned == true
+        else { return (Array(items.indices), nil) }
+        let pinnedIndices = items.indices.filter { items[$0].app?.pinned == true && $0 != dragged }
+        let rest = restLayout()
+        // Where the drag would insert among the pinned apps, from resting positions.
+        let x = dragPoint.x - left
+        var insertAt = pinnedIndices.count
+        for (n, i) in pinnedIndices.enumerated() where x < rest.centers[i] {
+            insertAt = n
+            break
+        }
+        let offDock = dragPoint.y > dockFrame.maxY + 90
+        var order = items.indices.filter { $0 != dragged }
+        if !offDock {
+            let anchor = insertAt < pinnedIndices.count ? order.firstIndex(of: pinnedIndices[insertAt])! : (order.firstIndex(of: pinnedIndices.last ?? 0).map { $0 + 1 } ?? 0)
+            order.insert(dragged, at: anchor)
+        }
+        return (order, offDock ? nil : dragged)
+    }
+
+    /// Returns true when every icon has reached its target position (always, except while reordering).
+    @discardableResult
+    private func render(time: CFTimeInterval = CACurrentMediaTime(), dt: Double = 1.0 / 120) -> Bool {
+        guard !items.isEmpty, scales.count == items.count else { return true }
+        let snapScale = scale
+        func snap(_ v: CGFloat) -> CGFloat { (v * snapScale).rounded() / snapScale }
+
+        let provisional = positions(for: scales, order: Array(items.indices))
+        let provisionalLeft = (bounds.width - provisional.width) / 2
+        let (order, gap) = dragOrder(left: provisionalLeft)
+        let (centers, width) = positions(for: scales, order: order)
+        let left = snap((bounds.width - width) / 2)
+        dockFrame = CGRect(x: left, y: bottomInset, width: snap(width), height: barHeight)
+
+        let reordering = draggingID != nil || time < reorderSettleUntil
+        let k = CGFloat(1 - exp(-22 * dt))
+        var settled = true
 
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        glass.frame = dockFrame
-        let iconBottom = bottomInset + padding + 4
+        if glass.frame != dockFrame { glass.frame = dockFrame }
+        let radius = (barHeight * 0.42).rounded()
+        if glass.cornerRadius != radius { glass.cornerRadius = radius }
+        let iconBottom = bottomInset + verticalPadding
         for (i, item) in items.enumerated() {
             guard let layer = layers[item.id] else { continue }
             let size = item.isSeparator ? base : base * scales[i]
-            var centerX = left + centers[i]
-            if item.id == draggingID { centerX = dragX }
-            var bounce: CGFloat = 0
-            if item.app?.launching == true { bounce = abs(sin(time * 5.5)) * 16 }
-            let width = item.isSeparator ? separatorWidth : size
-            layer.frame = CGRect(x: centerX - width / 2, y: iconBottom + bounce, width: width, height: size)
-            layer.zPosition = item.id == draggingID ? 10 : 0
-            layer.layoutContents()
+            var centerX = left + (centers[i] ?? 0)
+            // Icons glide into their new places while reordering instead of jumping.
+            if reordering, i != gap, let shown = shownX[item.id] {
+                let next = shown + (centerX - shown) * k
+                if abs(next - centerX) > 0.3 { settled = false; centerX = next }
+            }
+            shownX[item.id] = centerX
+            var y = iconBottom
+            if i == gap {
+                centerX = dragPoint.x
+                y = max(iconBottom, dragPoint.y - size / 2)
+            }
+            if let start = bounceStarts[item.id] {
+                y += bounceOffset(id: item.id, start: start, time: time, height: base * 0.6)
+            }
+            let w = item.isSeparator ? separatorWidth : size
+            layer.frame = CGRect(x: snap(centerX - w / 2), y: snap(y), width: snap(w), height: snap(size))
+            layer.zPosition = i == gap ? 10 : 0
+            layer.layoutContents(dotRoom: verticalPadding, pixels: size * snapScale, separatorHeight: base * 0.74)
+        }
+        // While dragged off the dock, the icon floats free with a "Remove" tag.
+        if let draggingID, gap == nil, let layer = layers[draggingID] {
+            layer.frame = CGRect(x: snap(dragPoint.x - base / 2), y: snap(dragPoint.y - base / 2), width: base, height: base)
+            layer.zPosition = 10
+            layer.layoutContents(dotRoom: verticalPadding, pixels: base * snapScale, separatorHeight: base * 0.74)
         }
         updateHover(centers: centers, left: left)
         CATransaction.commit()
+        return settled
     }
 
-    private func updateHover(centers: [CGFloat], left: CGFloat) {
+    /// Parabolic hops like the native launch bounce; once the app has launched, the hop in progress finishes
+    /// and the icon lands (with Reduce Motion, a single hop).
+    private func bounceOffset(id: String, start: CFTimeInterval, time: CFTimeInterval, height: CGFloat) -> CGFloat {
+        let hop = Self.hopDuration
+        let elapsed = time - start
+        let launching = items.first { $0.id == id }?.app?.launching == true
+        if !launching || (reduceMotion && elapsed >= hop) {
+            let stop = bounceStops[id] ?? ((elapsed / hop).rounded(.down) + 1) * hop
+            bounceStops[id] = stop
+            if elapsed >= stop {
+                bounceStarts[id] = nil
+                bounceStops[id] = nil
+                return 0
+            }
+        }
+        let p = elapsed.truncatingRemainder(dividingBy: hop) / hop
+        return height * CGFloat(4 * p * (1 - p))
+    }
+
+    private func updateHover(centers: [Int: CGFloat], left: CGFloat) {
         var id: String?
         if let cursorX, draggingID == nil {
             let nearest = items.indices.filter { !items[$0].isSeparator }
-                .min { abs(left + centers[$0] - cursorX) < abs(left + centers[$1] - cursorX) }
+                .min { abs(left + (centers[$0] ?? 0) - cursorX) < abs(left + (centers[$1] ?? 0) - cursorX) }
             id = nearest.map { items[$0].id }
         }
         if id != hovered {
             hovered = id
             onHoverChange?(id.flatMap { id in items.first { $0.id == id } })
         }
-        // Name tag above the hovered icon, tracking it every frame.
-        if let id, !holdsShape, let index = items.firstIndex(where: { $0.id == id }),
-           let layer = layers[id], case let name = items[index].displayName, !name.isEmpty {
-            nameTag.show(name, centeredAt: CGPoint(x: layer.frame.midX, y: layer.frame.maxY + 10))
+        if let draggingID, let layer = layers[draggingID], dragPoint.y > dockFrame.maxY + 90 {
+            nameTag.show("Remove", above: layer.frame, in: bounds)
+        } else if let id, !holdsShape, let layer = layers[id], let item = items.first(where: { $0.id == id }) {
+            nameTag.show(item.displayName, above: layer.frame, in: bounds)
         } else {
             nameTag.hide()
         }
     }
 
-    func iconCenterOnScreen(_ id: String) -> CGPoint? {
+    func iconFrameOnScreen(_ id: String) -> CGRect? {
         guard let layer = layers[id], let window else { return nil }
-        return window.convertPoint(toScreen: convert(CGPoint(x: layer.frame.midX, y: layer.frame.maxY), to: nil))
+        return window.convertToScreen(convert(layer.frame, to: nil))
     }
 
     // MARK: Mouse
@@ -305,7 +451,7 @@ final class DockStrip: NSView {
     private func item(at point: CGPoint) -> Item? {
         items.first { item in
             guard !item.isSeparator, let layer = layers[item.id] else { return false }
-            return layer.frame.insetBy(dx: -spacing / 2, dy: -4).contains(point)
+            return layer.frame.insetBy(dx: -spacing / 2, dy: -verticalPadding).contains(point)
         }
     }
 
@@ -313,35 +459,44 @@ final class DockStrip: NSView {
         let point = convert(event.locationInWindow, from: nil)
         pressedItem = item(at: point)
         pressPoint = point
+        if let pressed = pressedItem { layers[pressed.id]?.setPressed(true) }
     }
 
     override func mouseDragged(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
         guard let pressed = pressedItem, let app = pressed.app, app.pinned, let start = pressPoint else { return }
-        if draggingID == nil, hypot(point.x - start.x, point.y - start.y) > 5 { draggingID = app.id }
+        if draggingID == nil, hypot(point.x - start.x, point.y - start.y) > 5 {
+            draggingID = app.id
+            layers[app.id]?.setPressed(false)
+            onHoverChange?(nil)
+        }
         if draggingID != nil {
-            dragX = point.x
-            layers[app.id]?.opacity = point.y > dockFrame.maxY + 90 ? 0.4 : 1
+            dragPoint = point
             startAnimating()
         }
     }
 
     override func mouseUp(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
+        if let pressed = pressedItem { layers[pressed.id]?.setPressed(false) }
         defer {
             pressedItem = nil
             pressPoint = nil
-            if let id = draggingID { layers[id]?.opacity = 1 }
-            draggingID = nil
             startAnimating()
         }
         if let id = draggingID, let app = items.first(where: { $0.id == id })?.app {
+            draggingID = nil
+            reorderSettleUntil = CACurrentMediaTime() + 0.35
             if point.y > dockFrame.maxY + 90 {
-                // Dragged off the dock, like the native "Remove from Dock".
+                // Dragged off the dock: the native "poof".
+                if let layer = layers[id] { Poof.play(at: CGPoint(x: layer.frame.midX, y: layer.frame.midY), image: layer.currentImage, in: iconHost.layer, reduceMotion: reduceMotion) }
+                layers[id]?.isHidden = true
                 model.setPinned(app, false)
             } else {
-                let pinnedItems = items.compactMap(\.app).filter(\.pinned).filter { $0.id != id }
-                let target = pinnedItems.first { (layers[$0.id]?.frame.midX ?? 0) > point.x }
+                let rest = restLayout()
+                let left = (bounds.width - rest.width) / 2
+                let pinned = items.indices.filter { items[$0].app?.pinned == true && items[$0].id != id }
+                let target = pinned.first { left + rest.centers[$0] > point.x }.flatMap { items[$0].app }
                 model.move(app, before: target)
             }
             return
@@ -350,29 +505,15 @@ final class DockStrip: NSView {
         switch pressed {
         case .app(let app): model.open(app)
         case .trash: model.openTrash()
+        case .downloads, .minimized: onActivate?(pressed)
         case .separator: break
         }
         onHoverChange?(nil)
     }
 
     override func menu(for event: NSEvent) -> NSMenu? {
-        guard let item = item(at: convert(event.locationInWindow, from: nil)), let app = item.app else { return nil }
-        let menu = NSMenu()
-        func add(_ title: String, _ action: @escaping () -> Void) {
-            let entry = ClosureMenuItem(title: title, action: action)
-            menu.addItem(entry)
-        }
-        if app.pinned {
-            add("Remove from Dock") { [weak self] in self?.model.setPinned(app, false) }
-        } else {
-            add("Keep in Dock") { [weak self] in self?.model.setPinned(app, true) }
-        }
-        add("Show in Finder") { [weak self] in self?.model.showInFinder(app) }
-        if app.running, !app.id.hasSuffix("Finder.app") {
-            menu.addItem(.separator())
-            add("Quit") { [weak self] in self?.model.quit(app) }
-        }
-        return menu
+        guard let item = item(at: convert(event.locationInWindow, from: nil)) else { return nil }
+        return menuProvider?(item)
     }
 
     // MARK: File drops
@@ -382,10 +523,11 @@ final class DockStrip: NSView {
     override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
         let point = convert(sender.draggingLocation, from: nil)
         cursorX = point.x
+        if enteredAt == nil { enteredAt = CACurrentMediaTime() }
         startAnimating()
         switch item(at: point) {
         case .trash: return .move
-        case .app: return .generic
+        case .app, .downloads: return .generic
         default: return []
         }
     }
@@ -398,23 +540,46 @@ final class DockStrip: NSView {
         switch item(at: convert(sender.draggingLocation, from: nil)) {
         case .trash: model.trash(urls)
         case .app(let app): model.open(urls, with: app)
+        case .downloads:
+            for url in urls {
+                try? FileManager.default.moveItem(at: url, to: DockExtras.downloadsFolder.appendingPathComponent(url.lastPathComponent))
+            }
         default: return false
         }
         return true
     }
 }
 
-private extension DockStrip.Item {
-    var displayName: String {
-        switch self {
-        case .app(let app): app.name
-        case .trash: "Bin"
-        case .separator: ""
-        }
+// MARK: - Icon layer
+
+/// Rasterises an icon at exactly the pixel size it's shown at (in a few sizes), so it stays as crisp as the
+/// native Dock's at rest and while magnified.
+enum IconRaster {
+    private static var cache: [String: CGImage] = [:]
+
+    static func image(_ source: NSImage, key: String, pixels: CGFloat) -> CGImage? {
+        // A handful of sizes: exact at rest, then steps while magnifying.
+        let step = max(16, pixels.rounded(.up))
+        let cacheKey = "\(key)@\(Int(step))"
+        if let cached = cache[cacheKey] { return cached }
+        let size = Int(step)
+        guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: size, pixelsHigh: size, bitsPerSample: 8,
+                                         samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB,
+                                         bytesPerRow: 0, bitsPerPixel: 0)
+        else { return nil }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+        NSGraphicsContext.current?.imageInterpolation = .high
+        // Asking NSImage for an exact pixel rect makes it pick the icon's own best artwork for that size.
+        source.draw(in: NSRect(x: 0, y: 0, width: size, height: size), from: .zero, operation: .copy, fraction: 1,
+                    respectFlipped: false, hints: [.ctm: NSAffineTransform()])
+        NSGraphicsContext.restoreGraphicsState()
+        let image = rep.cgImage
+        if cache.count > 600 { cache.removeAll() }
+        cache[cacheKey] = image
+        return image
     }
 }
-
-// MARK: - Layers
 
 private final class IconLayer: CALayer {
     private let image = CALayer()
@@ -422,123 +587,269 @@ private final class IconLayer: CALayer {
     private let badge = CALayer()
     private let badgeText = CATextLayer()
     private let line = CALayer()
+    private let miniBadge = CALayer()
     private var isSeparator = false
     private var hasBadge = false
+    private var source: NSImage?
+    private var sourceKey = ""
+    private var lastPixels: CGFloat = 0
+    private var restImage: CGImage?
+    private var largeImage: CGImage?
+    private var restPixels: CGFloat = 1
+    private var usingLarge = false
+    private var contentsScaleValue: CGFloat = 2
+    var tileSize: CGFloat = 37
+    var largeTile: CGFloat = 73
+    private var pressed = false
+    private(set) var currentImage: CGImage?
 
     override init() {
         super.init()
         image.contentsGravity = .resizeAspect
         image.minificationFilter = .trilinear
         addSublayer(image)
-        dot.backgroundColor = NSColor.white.withAlphaComponent(0.85).cgColor
         dot.cornerRadius = 2
         addSublayer(dot)
-        badge.backgroundColor = NSColor.systemRed.cgColor
+        badge.backgroundColor = NSColor(red: 1, green: 0.23, blue: 0.19, alpha: 1).cgColor
+        badge.shadowColor = NSColor.black.cgColor
+        badge.shadowOpacity = 0.3
+        badge.shadowRadius = 1.5
+        badge.shadowOffset = CGSize(width: 0, height: -0.5)
         badgeText.alignmentMode = .center
         badgeText.foregroundColor = NSColor.white.cgColor
         badge.addSublayer(badgeText)
         addSublayer(badge)
-        line.backgroundColor = NSColor.white.withAlphaComponent(0.25).cgColor
         addSublayer(line)
+        miniBadge.contentsGravity = .resizeAspect
+        addSublayer(miniBadge)
     }
 
     override init(layer: Any) { super.init(layer: layer) }
     required init?(coder: NSCoder) { fatalError() }
 
-    func setScale(_ scale: CGFloat) {
-        [self, image, dot, badge, badgeText, line].forEach { $0.contentsScale = scale }
+    func contentsScaleChanged(_ scale: CGFloat) {
+        [self, image, dot, badge, badgeText, line, miniBadge].forEach { $0.contentsScale = scale }
+        contentsScaleValue = scale
+        prepareRasters()
     }
 
-    func configure(_ item: DockStrip.Item, tile: CGFloat) {
+    /// Running dots and separators follow light/dark appearance like the native Dock.
+    func setDark(_ dark: Bool) {
+        dot.backgroundColor = (dark ? NSColor(white: 1, alpha: 0.72) : NSColor(white: 0, alpha: 0.55)).cgColor
+        line.backgroundColor = (dark ? NSColor(white: 1, alpha: 0.28) : NSColor(white: 0, alpha: 0.2)).cgColor
+    }
+
+    /// The press highlight: the icon darkens while the mouse is down, like the native Dock.
+    func setPressed(_ on: Bool) {
+        guard on != pressed else { return }
+        pressed = on
         CATransaction.begin()
         CATransaction.setDisableActions(true)
+        if on, let filter = CIFilter(name: "CIColorControls") {
+            filter.setValue(-0.28, forKey: kCIInputBrightnessKey)
+            image.filters = [filter]
+        } else {
+            image.filters = nil
+        }
+        CATransaction.commit()
+    }
+
+    func configure(_ item: DockStrip.Item) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        isSeparator = item.isSeparator
+        line.isHidden = !isSeparator
+        image.isHidden = isSeparator
+        miniBadge.isHidden = true
+        hasBadge = false
+        dot.isHidden = true
         switch item {
         case .app(let app):
-            isSeparator = false
-            image.contents = app.icon.cgImage(forProposedRect: nil, context: nil, hints: nil)
+            setSource(app.icon, key: app.id)
             dot.isHidden = !app.running
             hasBadge = app.badge != nil
             badgeText.string = app.badge
-            line.isHidden = true
         case .trash(let full):
-            isSeparator = false
-            image.contents = TrashArt.image(full: full)?.cgImage(forProposedRect: nil, context: nil, hints: nil)
-            dot.isHidden = true
-            hasBadge = false
-            line.isHidden = true
+            if let art = TrashArt.image(full: full) { setSource(art, key: full ? "trash-full" : "trash") }
+        case .downloads:
+            setSource(NSWorkspace.shared.icon(forFile: DockExtras.downloadsFolder.path), key: "downloads")
+        case .minimized(let window):
+            if let thumb = window.thumbnail {
+                setSource(thumb, key: "min-\(window.id)-thumb")
+            } else {
+                setSource(window.appIcon, key: "min-\(window.id)-icon")
+            }
+            miniBadge.contents = window.appIcon.cgImage(forProposedRect: nil, context: nil, hints: nil)
+            miniBadge.isHidden = false
         case .separator:
-            isSeparator = true
-            image.contents = nil
-            dot.isHidden = true
-            hasBadge = false
-            line.isHidden = false
+            break
         }
         badge.isHidden = !hasBadge
         CATransaction.commit()
     }
 
-    /// Positions children for the current frame size (called inside the frame loop's transaction).
-    func layoutContents() {
+    private func setSource(_ newSource: NSImage, key: String) {
+        guard key != sourceKey || source !== newSource else { return }
+        source = newSource
+        sourceKey = key
+        prepareRasters()
+    }
+
+    private func prepareRasters() {
+        guard let source else { return }
+        restPixels = tileSize * contentsScaleValue
+        restImage = IconRaster.image(source, key: sourceKey, pixels: restPixels)
+        largeImage = IconRaster.image(source, key: sourceKey, pixels: largeTile * contentsScaleValue)
+        image.contents = nil
+    }
+
+    /// Positions children for the current size (called inside the frame loop's transaction).
+    func layoutContents(dotRoom: CGFloat, pixels: CGFloat, separatorHeight: CGFloat) {
         let size = bounds.size
         if isSeparator {
-            line.frame = CGRect(x: size.width / 2 - 0.5, y: size.height * 0.1, width: 1, height: size.height * 0.8)
+            line.frame = CGRect(x: (size.width / 2).rounded() - 0.5, y: (size.height - separatorHeight) / 2, width: 1, height: separatorHeight)
             return
         }
+        // Two rasters prepared ahead of time (exact at rest, exact when fully magnified); the frame loop only
+        // picks one, never draws.
+        let wantLarge = pixels > restPixels * 1.2
+        if source != nil, wantLarge != usingLarge || image.contents == nil {
+            usingLarge = wantLarge
+            currentImage = wantLarge ? largeImage : restImage
+            image.contents = currentImage
+        }
         image.frame = bounds
-        dot.frame = CGRect(x: size.width / 2 - 2, y: -7, width: 4, height: 4)
+        // The running dot sits centred in the bar's bottom padding.
+        dot.frame = CGRect(x: (size.width / 2 - 2).rounded(), y: -(dotRoom / 2) - 2, width: 4, height: 4)
+        if !miniBadge.isHidden {
+            let d = size.width * 0.38
+            miniBadge.frame = CGRect(x: size.width - d * 0.85, y: -d * 0.1, width: d, height: d)
+        }
         if hasBadge {
-            let d = max(16, size.width * 0.38)
-            badge.frame = CGRect(x: size.width - d * 0.75, y: size.height - d * 0.8, width: d, height: d)
-            badge.cornerRadius = d / 2
-            // Text is re-rasterised only when its whole-point size changes, not on every frame.
-            let fontSize = max(10, (size.width * 0.26).rounded())
+            // A red capsule that widens to fit the count, centred on the top-right corner.
+            let fontSize = max(9, (size.width * 0.24).rounded())
             if badgeText.fontSize != fontSize {
                 badgeText.fontSize = fontSize
                 badgeText.font = NSFont.systemFont(ofSize: fontSize, weight: .semibold)
             }
-            badgeText.frame = CGRect(x: 0, y: (d - fontSize * 1.25) / 2, width: d, height: fontSize * 1.25)
+            let font = NSFont.systemFont(ofSize: fontSize, weight: .semibold)
+            let label = (badgeText.string as? String) ?? ""
+            let textWidth = ceil((label as NSString).size(withAttributes: [.font: font]).width)
+            let height = (fontSize * 1.55).rounded()
+            let width = max(height, textWidth + fontSize * 0.9)
+            badge.frame = CGRect(x: size.width - width * 0.62, y: size.height - height * 0.72, width: width, height: height)
+            badge.cornerRadius = height / 2
+            let lineHeight = ceil(font.ascender - font.descender)
+            badgeText.frame = CGRect(x: 0, y: (height - lineHeight) / 2 - font.descender * 0.15, width: width, height: lineHeight)
         }
     }
 }
 
-private final class NameTagLayer: CALayer {
-    let text = CATextLayer()
+// MARK: - Name tag
+
+/// The label above a hovered icon: a glass capsule in the system font, like the macOS 26 Dock.
+private final class NameTagView: NSGlassEffectView {
+    private let label = NSTextField(labelWithString: "")
     private var current: String?
 
-    override init() {
-        super.init()
-        backgroundColor = NSColor(white: 0.12, alpha: 0.82).cgColor
-        borderColor = NSColor.white.withAlphaComponent(0.12).cgColor
-        borderWidth = 0.5
-        text.alignmentMode = .center
-        text.foregroundColor = NSColor.white.cgColor
-        text.fontSize = 12
-        text.font = NSFont.systemFont(ofSize: 12, weight: .medium)
-        addSublayer(text)
-        opacity = 0
-        zPosition = 20
+    init() {
+        super.init(frame: .zero)
+        label.font = .systemFont(ofSize: 13, weight: .medium)
+        label.textColor = .labelColor
+        label.alignment = .center
+        let content = NSView()
+        content.addSubview(label)
+        contentView = content
+        isHidden = true
     }
 
-    override init(layer: Any) { super.init(layer: layer) }
     required init?(coder: NSCoder) { fatalError() }
 
-    func show(_ name: String, centeredAt point: CGPoint) {
+    func show(_ name: String, above icon: CGRect, in bounds: CGRect) {
         if name != current {
             current = name
-            text.string = name
-            let width = (name as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 12, weight: .medium)]).width + 22
-            bounds = CGRect(x: 0, y: 0, width: width.rounded(.up), height: 24)
-            cornerRadius = 12
-            text.frame = CGRect(x: 0, y: 4, width: bounds.width, height: 16)
+            label.stringValue = name
         }
-        position = CGPoint(x: point.x.rounded(), y: point.y + 12)
-        opacity = 1
+        let width = ceil(label.intrinsicContentSize.width) + 24
+        let height: CGFloat = 26
+        let x = min(max(icon.midX - width / 2, 6), bounds.width - width - 6)
+        let target = CGRect(x: x.rounded(), y: (icon.maxY + 10).rounded(), width: width, height: height)
+        if frame != target { frame = target }
+        cornerRadius = height / 2
+        label.frame = CGRect(x: 0, y: (height - 17) / 2, width: width, height: 17)
+        isHidden = false
     }
 
     func hide() {
+        guard !isHidden else { return }
         current = nil
-        opacity = 0
+        isHidden = true
     }
+}
+
+// MARK: - Poof
+
+enum Poof {
+    /// The removal puff: the icon swells and vanishes in a small cloud.
+    static func play(at point: CGPoint, image: CGImage?, in parent: CALayer?, reduceMotion: Bool) {
+        guard let parent else { return }
+        let ghost = CALayer()
+        ghost.contents = image
+        ghost.contentsGravity = .resizeAspect
+        ghost.bounds = CGRect(x: 0, y: 0, width: 48, height: 48)
+        ghost.position = point
+        ghost.zPosition = 30
+        parent.addSublayer(ghost)
+
+        CATransaction.begin()
+        CATransaction.setCompletionBlock { ghost.removeFromSuperlayer() }
+        let grow = CABasicAnimation(keyPath: "transform.scale")
+        grow.toValue = reduceMotion ? 1 : 1.6
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.toValue = 0
+        let group = CAAnimationGroup()
+        group.animations = [grow, fade]
+        group.duration = 0.28
+        group.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        group.fillMode = .forwards
+        group.isRemovedOnCompletion = false
+        ghost.add(group, forKey: "poof")
+        CATransaction.commit()
+
+        guard !reduceMotion else { return }
+        let emitter = CAEmitterLayer()
+        emitter.emitterPosition = point
+        emitter.emitterShape = .circle
+        emitter.emitterSize = CGSize(width: 24, height: 24)
+        emitter.zPosition = 31
+        let cell = CAEmitterCell()
+        cell.contents = puffImage
+        cell.birthRate = 160
+        cell.lifetime = 0.45
+        cell.velocity = 70
+        cell.velocityRange = 40
+        cell.emissionRange = .pi * 2
+        cell.scale = 0.35
+        cell.scaleRange = 0.2
+        cell.scaleSpeed = 0.6
+        cell.alphaSpeed = -2.2
+        emitter.emitterCells = [cell]
+        parent.addSublayer(emitter)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { emitter.birthRate = 0 }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { emitter.removeFromSuperlayer() }
+    }
+
+    private static let puffImage: CGImage? = {
+        let size = 32
+        guard let ctx = CGContext(data: nil, width: size, height: size, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return nil }
+        let colors = [CGColor(gray: 1, alpha: 0.9), CGColor(gray: 1, alpha: 0)] as CFArray
+        guard let gradient = CGGradient(colorsSpace: CGColorSpaceCreateDeviceGray(), colors: colors, locations: [0, 1]) else { return nil }
+        ctx.drawRadialGradient(gradient, startCenter: CGPoint(x: 16, y: 16), startRadius: 0,
+                               endCenter: CGPoint(x: 16, y: 16), endRadius: 16, options: [])
+        return ctx.makeImage()
+    }()
 }
 
 enum TrashArt {
@@ -553,13 +864,14 @@ enum TrashArt {
     }
 }
 
-private final class ClosureMenuItem: NSMenuItem {
+final class ClosureMenuItem: NSMenuItem {
     private let handler: () -> Void
 
-    init(title: String, action handler: @escaping () -> Void) {
+    init(title: String, state: NSControl.StateValue = .off, action handler: @escaping () -> Void) {
         self.handler = handler
         super.init(title: title, action: #selector(run), keyEquivalent: "")
         target = self
+        self.state = state
     }
 
     required init(coder: NSCoder) { fatalError() }

@@ -133,25 +133,10 @@ final class DockModel: ObservableObject {
         if full != trashFull { trashFull = full }
     }
 
+    /// The system icon itself: the strip renders it at the exact pixel size it's shown at, for crispness.
     private func icon(for path: String) -> NSImage {
         if let cached = icons[path] { return cached }
-        // Drawn once into a bitmap at the largest size it's ever shown (Retina), so magnifying only scales pixels.
-        let source = NSWorkspace.shared.icon(forFile: path)
-        let pixels = Int(ceil(largeSize * 2))
-        let image: NSImage
-        if let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: pixels, pixelsHigh: pixels, bitsPerSample: 8,
-                                      samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB,
-                                      bytesPerRow: 0, bitsPerPixel: 0) {
-            rep.size = NSSize(width: largeSize, height: largeSize)
-            NSGraphicsContext.saveGraphicsState()
-            NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
-            source.draw(in: NSRect(x: 0, y: 0, width: largeSize, height: largeSize))
-            NSGraphicsContext.restoreGraphicsState()
-            image = NSImage(size: rep.size)
-            image.addRepresentation(rep)
-        } else {
-            image = source
-        }
+        let image = NSWorkspace.shared.icon(forFile: path)
         icons[path] = image
         return image
     }
@@ -160,10 +145,41 @@ final class DockModel: ObservableObject {
 
     /// Same as clicking a Dock icon: launch, or activate and reopen a window if it has none.
     func open(_ app: DockApp) {
+        if let running = NSWorkspace.shared.runningApplications.first(where: { $0.bundleURL?.path == app.id }),
+           Self.hasWindows(running.processIdentifier) {
+            Self.bringForward(running)
+            return
+        }
+        // Not running, or running with no windows: launch / send the "reopen" event, like the native Dock.
         if !app.running { launching.insert(app.id); rebuild() }
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.activates = true
         NSWorkspace.shared.openApplication(at: app.url, configuration: configuration)
+    }
+
+    /// macOS ignores activation requests from background apps, so this goes through Accessibility, which
+    /// activates the app and switches to the desktop its windows are on (as the native Dock does).
+    static func bringForward(_ app: NSRunningApplication, raiseMain: Bool = true) {
+        let element = AXUIElementCreateApplication(app.processIdentifier)
+        AXUIElementSetAttributeValue(element, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
+        var window: CFTypeRef?
+        // When a specific window was just raised, don't raise the app's main window over it.
+        if raiseMain, AXUIElementCopyAttributeValue(element, kAXMainWindowAttribute as CFString, &window) == .success, let window {
+            AXUIElementPerformAction(window as! AXUIElement, kAXRaiseAction as CFString)
+        }
+        app.activate(options: [.activateAllWindows])
+    }
+
+    /// Any real window on any desktop (minimised ones included). Apps like Finder keep invisible full-width
+    /// strips at the normal window level, so a window must have real width and height to count.
+    static func hasWindows(_ pid: pid_t) -> Bool {
+        let windows = CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+        return windows.contains {
+            guard ($0[kCGWindowOwnerPID as String] as? pid_t) == pid, ($0[kCGWindowLayer as String] as? Int) == 0,
+                  let bounds = $0[kCGWindowBounds as String] as? [String: CGFloat]
+            else { return false }
+            return (bounds["Width"] ?? 0) > 150 && (bounds["Height"] ?? 0) > 100
+        }
     }
 
     func open(_ files: [URL], with app: DockApp) {

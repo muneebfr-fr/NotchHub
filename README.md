@@ -18,7 +18,7 @@ A small macOS app that turns the MacBook notch into a hub. Hover over the notch 
 - **Claude Code status:** An amber indicator in the notch when a Claude Code session needs your permission (see below).
 - **Window snapping:** Drag a window to a screen edge or corner, or press ⌃⌥T once for a half, twice for a third, three times for full screen. Windows glide into place.
 - **Downloads tidy-up:** New downloads are sorted into folders by type; files untouched for 30 days move to `Downloads/Old`; leftover installers show up in the panel. Nothing is ever deleted.
-- **GlassDock toggle:** Switches the companion [GlassDock](#glassdock) app on and off, restoring the normal Dock when off.
+- **Companion app toggles:** Switch [GlassDock](#glassdock) and [Edge Shelf](#edge-shelf) on and off from the Shortcuts header. Each runs as its own app and is restarted if it crashes.
 
 NotchHub has no Dock icon and starts automatically at login. To quit it, use the power button in the Shortcuts card. It starts again at your next login.
 
@@ -79,14 +79,21 @@ Add these hooks to `~/.claude/settings.json` (adjust the path if you cloned else
 
 GlassDock (in the `GlassDock/` folder) is a companion app: a Liquid Glass replacement for the macOS Dock, drawn with Core Animation so magnification tracks the cursor at full frame rate.
 
-- Copies your current Dock's apps, order, icon size and magnification.
-- Live window previews on hover (click one to bring that window forward), running dots, unread badges, launch bounce.
-- Drag icons to reorder, drag one off the dock to remove it, drop files on an app or the Bin, right-click for the usual menu.
-- Auto-hides like the native Dock and stays out of full-screen apps.
+- Copies your current Dock's apps, order, icon size and magnification, with crisp icons rendered at their exact pixel size.
+- Native-style motion: slides in from off-screen, cosine magnification curve, parabolic launch bounce, eased relax when you leave. Respects Reduce Motion and Light/Dark appearance.
+- Live window previews on hover. Clicking one brings up that exact window, sliding to its desktop if it's on another one. Drag a file onto a preview and hold to spring that window open with the cursor at the same spot.
+- Press darkening, drag to reorder (other icons make room), drag off to remove (with a poof), drop files on an app, the Bin or the Downloads stack.
+- Right-click menu with the app's windows, Options (Keep in Dock, Open at Login, Show in Finder, Assign To desktop), Hide, and Quit (Force Quit with ⌥).
+- Downloads stack (grid of recent downloads), minimised windows beside the Bin, unread badges, running dots, glass name tags, Empty Bin with confirmation.
+- Auto-hides like the native Dock, shows during Mission Control, and stays out of full-screen apps.
 
-`./build.sh` builds it alongside NotchHub. Turn it on with the Dock icon in the Shortcuts header: the macOS Dock is hidden while it runs and your original settings are restored when you switch it off (or if it ever crashes three times in a minute). GlassDock asks for Accessibility (badges, focusing a window) and Screen Recording (previews).
+`./build.sh` builds it alongside NotchHub. Turn it on with the Dock icon in the Shortcuts header: the macOS Dock is hidden while it runs and your original settings are restored when you switch it off (or if it ever crashes three times in a minute). GlassDock asks for Accessibility (badges, focusing windows, desktop switching) and Screen Recording (previews). Switching to a window on another desktop uses the "Move left/right a space" shortcuts (⌃← / ⌃→), which are on by default.
 
 If your Dock ever stays hidden: `defaults delete com.apple.dock autohide; defaults delete com.apple.dock autohide-delay; killall Dock`
+
+## Edge Shelf
+
+Edge Shelf (in the `EdgeShelf/` folder) is a companion app: a glass shelf that slides out of the right edge of the screen. Rest the cursor against the edge for a moment, or drag something there, and drop in files, links, images or text. Click a card to open it (text is copied), drag it out into any app, or right-click for Open / Copy / Show in Finder / Remove. Files are referenced, not copied, and followed if moved; items stay until you remove them. It needs no permissions. Turn it on with the sidebar icon in the Shortcuts header.
 
 ## Local add-ons
 

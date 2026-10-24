@@ -4,6 +4,7 @@ A small macOS app that turns the MacBook notch into a hub. Hover over the notch 
 
 - **Now Playing:** The Spotify or Apple Music track with album art, a progress bar and play/pause/skip controls. While music plays, the collapsed notch shows a mini cover and an animated equalizer.
 - **Clipboard history:** Text and images in separate tabs. Click an item to copy it again, or drag an image straight into another app. Password-manager secrets are skipped, and history is kept in memory only.
+- **Clipboard actions:** After you copy text, a glass pill drops from the notch with Fix grammar, Summarize (longer text) or Translate; a link offers a QR code to open it on your phone, and a screenshot offers Extract text. The same actions are on every history item (✦ on hover, or right-click). Results go onto the clipboard as a new item, so the original is never lost. Everything runs on-device with Apple's model and text recognition.
 - **Shortcuts:** One-click links to your sites, plus the Claude desktop app.
 - **Screen recording:** Record the screen with system audio to `~/Movies/NotchHub`. While it records, the collapsed notch shows a red dot and a timer, and NotchHub keeps itself out of the video.
 - **Volume and brightness bar:** A Liquid Glass bar that drips out of the notch like liquid and replaces the native macOS overlay. While the panel is open, it slides out from under the panel instead.
@@ -45,6 +46,7 @@ cd NotchHub
 | **Screen Recording** | Needed for the Record button. macOS may ask you to quit and reopen NotchHub after you allow it. |
 | **System Audio Recording** | Per-app volume and the audio visualizer. Audio never leaves your Mac and isn't saved. |
 | **Downloads folder** | Sorting your downloads. |
+| **Apple Intelligence** (no prompt) | Clipboard actions use Apple's on-device model when it's enabled in System Settings; Extract text works either way. |
 | **Automation (Spotify / Music / Xcode / Safari / Chrome)** | Lets NotchHub read the current track and send play, pause and skip commands. |
 
 Each build has a new signature, so macOS treats it as a new app. `build.sh` clears the old Accessibility and Screen Recording entries and relaunches the app, so after rebuilding you only need to switch NotchHub back on when it asks.
@@ -82,6 +84,8 @@ GlassDock (in the `GlassDock/` folder) is a companion app that adds window previ
 - Hover a running app's icon and its windows appear as glass cards above it. Moving to another icon switches instantly.
 - Click a card to bring up that exact window, sliding to its desktop if it's on another one.
 - Drag a file over a Dock icon, onto a card, and hold: that window springs open with the cursor at the same spot, so you drop the file exactly where you aimed.
+
+**⌥Tab window switcher:** hold ⌥ and tap Tab for live thumbnails of every window on every desktop (⇧Tab goes back, Esc cancels); release ⌥ to jump to that window. A quick ⌥Tab flips straight to your previous window. ⌘Tab is left untouched.
 
 It follows the Dock's own hover through Accessibility, so it's event-driven and idles at zero. `./build.sh` builds it alongside NotchHub; turn it on with the Dock icon in the Shortcuts header. It asks for Accessibility (following the Dock, focusing windows) and Screen Recording (previews). Switching to a window on another desktop uses the "Move left/right a space" shortcuts (⌃← / ⌃→), which are on by default. Previews assume the Dock is at the bottom of the screen.
 

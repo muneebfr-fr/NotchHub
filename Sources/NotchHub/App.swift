@@ -136,6 +136,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private lazy var companions = CompanionApps(glassDock: glassDock, edgeShelf: edgeShelf)
+    private lazy var clipboardActions = ClipboardActions(store: clipboard)
+
+    /// The action pill's frame on screen.
+    private var pillOnScreen: CGRect {
+        let r = clipboardActions.pillRect
+        return CGRect(x: panel.frame.minX + r.minX, y: panel.frame.maxY - r.maxY, width: r.width, height: r.height)
+    }
 
     private func makeHost() -> NSView {
         let host = NSHostingView(
@@ -153,6 +160,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 .environmentObject(mixer)
                 .environmentObject(visualizer)
                 .environmentObject(companions)
+                .environmentObject(clipboardActions)
         )
         // The window has a fixed size, so skip SwiftUI's per-layout window size negotiation.
         host.sizingOptions = []
@@ -219,7 +227,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             height: expanded.height + 4
         ).insetBy(dx: -16, dy: -16)
 
+        // The clipboard action pill takes clicks only where it actually is.
+        let overPill = clipboardActions.suggestion != nil && pillOnScreen.insetBy(dx: -6, dy: -6).contains(mouse)
+
         if !state.expanded {
+            if !extensionIsInteractive { panel.ignoresMouseEvents = !overPill }
             // Mission Control's Spaces bar lives at the top of the screen; reaching for it mustn't open the panel.
             // A held button means something is being dragged (e.g. a window to the top edge), not a hover.
             if notchRect.contains(mouse), NSEvent.pressedMouseButtons == 0, !Self.isMissionControlActive() {
@@ -230,7 +242,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // A short grace period stops the panel flickering shut when the cursor grazes its edge.
         // Holding a mouse button (e.g. dragging an image out) keeps it open.
-        if panelRect.contains(mouse) || NSEvent.pressedMouseButtons != 0 {
+        if panelRect.contains(mouse) || overPill || NSEvent.pressedMouseButtons != 0 {
             outsideSince = nil
         } else if let since = outsideSince {
             if Date().timeIntervalSince(since) > 0.18 { setExpanded(false) }

@@ -24,6 +24,14 @@ enum WindowFocus {
     private static let spacesForWindows: SpacesForWindows? = skyLight.flatMap { dlsym($0, "SLSCopySpacesForWindows") }.map { unsafeBitCast($0, to: SpacesForWindows.self) }
     private static let managedSpaces: ManagedSpaces? = skyLight.flatMap { dlsym($0, "SLSCopyManagedDisplaySpaces") }.map { unsafeBitCast($0, to: ManagedSpaces.self) }
 
+    /// True if the window lives on some desktop (filters out hidden helper windows apps keep off-screen).
+    static func isOnSomeDesktop(_ windowID: CGWindowID) -> Bool {
+        guard let mainConnection, let spacesForWindows else { return true }
+        let ids = [NSNumber(value: windowID)] as CFArray
+        let spaces = spacesForWindows(mainConnection(), 0x7, ids)?.takeRetainedValue() as? [NSNumber]
+        return !(spaces ?? []).isEmpty
+    }
+
     static func focus(windowID: CGWindowID, pid: pid_t, title: String) {
         guard let app = NSRunningApplication(processIdentifier: pid) else { return }
         if isOnScreen(windowID) {

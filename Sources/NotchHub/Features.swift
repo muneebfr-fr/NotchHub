@@ -117,6 +117,17 @@ final class ClipboardStore: ObservableObject {
     @Published private(set) var items: [String] = []
     @Published private(set) var images: [ClipImage] = []
     @Published private(set) var lastAddedKind: Kind = .text
+    /// Something the user just copied in another app (never NotchHub's own writes), for clipboard actions.
+    @Published private(set) var freshCopy: FreshCopy?
+
+    struct FreshCopy: Identifiable {
+        let id = UUID()
+        let text: String?
+        let image: ClipImage?
+    }
+
+    /// Change count of NotchHub's own last write, so re-copies and AI results don't trigger suggestions.
+    private var ownChangeCount = -1
 
     private let maxItems = 10
     // Full-resolution screenshots can be several MB each, so image history is kept shorter.
@@ -144,6 +155,7 @@ final class ClipboardStore: ObservableObject {
 
         let types = Set(pasteboard.types?.map(\.rawValue) ?? [])
         guard types.isDisjoint(with: skippedTypes) else { return }
+        let external = pasteboard.changeCount != ownChangeCount
 
         // Text wins: rich-text copies (Word, Excel, browsers) often carry an image rendering alongside the text.
         if let text = pasteboard.string(forType: .string),
@@ -152,6 +164,7 @@ final class ClipboardStore: ObservableObject {
             items.insert(text, at: 0)
             if items.count > maxItems { items.removeLast(items.count - maxItems) }
             lastAddedKind = .text
+            if external { freshCopy = FreshCopy(text: text, image: nil) }
             return
         }
 
@@ -166,6 +179,7 @@ final class ClipboardStore: ObservableObject {
                 continue
             }
             lastAddedKind = .image
+            if external, let image = images.first { freshCopy = FreshCopy(text: nil, image: image) }
             return
         }
     }
@@ -185,11 +199,13 @@ final class ClipboardStore: ObservableObject {
     func copy(_ text: String) {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
+        ownChangeCount = NSPasteboard.general.changeCount
     }
 
     func copy(_ image: ClipImage) {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setData(image.data, forType: image.type)
+        ownChangeCount = NSPasteboard.general.changeCount
     }
 
     func clearText() {

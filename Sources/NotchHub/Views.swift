@@ -24,6 +24,7 @@ struct NotchView: View {
     @EnvironmentObject var claudeCode: ClaudeCodeMonitor
     @EnvironmentObject var appContext: AppContextMonitor
     @EnvironmentObject var downloads: DownloadsTidier
+    @EnvironmentObject var clipboardActions: ClipboardActions
     let localOverlay: AnyView?
 
     private let liveActivityWing: CGFloat = 34
@@ -108,6 +109,18 @@ struct NotchView: View {
                     .padding(.horizontal, 9)
                     .frame(width: size.width, height: state.notchSize.height)
                     .transition(.blurReplace)
+            }
+
+            if clipboardActions.suggestion != nil {
+                ClipboardActionPill()
+                    // Below the notch, below the open panel, or below the volume bar if that's showing.
+                    .padding(.top, state.expanded
+                        ? panelSize.height + 10
+                        : state.notchSize.height + 10 + (hud.visible ? HUDView.size.height + 22 : 0))
+                    .transition(.asymmetric(
+                        insertion: .scale(scale: 0.6, anchor: .top).combined(with: .opacity),
+                        removal: .scale(scale: 0.85, anchor: .top).combined(with: .opacity)
+                    ))
             }
 
             if let localOverlay, !state.expanded {
@@ -653,6 +666,9 @@ struct ClipboardCard: View {
     enum Tab { case text, images }
 
     @EnvironmentObject var clipboard: ClipboardStore
+    @EnvironmentObject var clipboardActions: ClipboardActions
+    @State private var hoveredRow: String?
+    @State private var hoveredImage: UUID?
     @State private var tab: Tab = .text
     @State private var lastCopied: String?
     @State private var lastCopiedImage: UUID?
@@ -801,7 +817,30 @@ struct ClipboardCard: View {
         }
         .buttonStyle(.plain)
         .onDrag { Self.dragProvider(for: image) }
-        .help("Click to copy, or drag it into another app")
+        .help("Click to copy, drag it into another app, or ✦ to extract its text")
+        .overlay(alignment: .bottomTrailing) {
+            // Same ✦ as text items: one tap pulls the text out of the screenshot.
+            if hoveredImage == image.id {
+                Button { clipboardActions.perform(.extractText, image: image) } label: {
+                    Image(systemName: "sparkles")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(.white)
+                        .frame(width: 20, height: 20)
+                        .background(Circle().fill(Color.black.opacity(0.55)))
+                        .overlay(Circle().strokeBorder(Color.white.opacity(0.25), lineWidth: 0.5))
+                        .contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .padding(4)
+                .help("Extract text")
+                .transition(.scale(scale: 0.6).combined(with: .opacity))
+            }
+        }
+        .onHover { hoveredImage = $0 ? image.id : (hoveredImage == image.id ? nil : hoveredImage) }
+        .animation(.spring(duration: 0.25, bounce: 0.2), value: hoveredImage == image.id)
+        .contextMenu {
+            Button("Extract text", systemImage: "text.viewfinder") { clipboardActions.perform(.extractText, image: image) }
+        }
         .animation(.spring(duration: 0.3, bounce: 0.3), value: copied)
     }
 
@@ -839,9 +878,36 @@ struct ClipboardCard: View {
             }
             .padding(.horizontal, 8)
             .padding(.vertical, 6)
+            .padding(.trailing, hoveredRow == item ? 22 : 0)
             .contentShape(Rectangle())
         }
         .buttonStyle(HoverButtonStyle(radius: 8))
+        .overlay(alignment: .trailing) {
+            // The same actions the after-copy pill offers, on any item in the history.
+            let actions = ClipboardActions.actions(for: item, image: nil)
+            if hoveredRow == item, !actions.isEmpty {
+                Menu {
+                    ForEach(actions) { action in
+                        Button(action.title, systemImage: action.symbol) { clipboardActions.perform(action, text: item) }
+                    }
+                } label: {
+                    Image(systemName: "sparkles")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(Palette.sky)
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .padding(.trailing, 8)
+                .help("Actions")
+            }
+        }
+        .contextMenu {
+            ForEach(ClipboardActions.actions(for: item, image: nil)) { action in
+                Button(action.title, systemImage: action.symbol) { clipboardActions.perform(action, text: item) }
+            }
+        }
+        .onHover { hoveredRow = $0 ? item : (hoveredRow == item ? nil : hoveredRow) }
         .animation(.spring(duration: 0.3, bounce: 0.3), value: lastCopied)
     }
 }

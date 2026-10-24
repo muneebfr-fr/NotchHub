@@ -24,6 +24,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var panel: PreviewPanel!
     private let previews = PreviewModel()
     private let watcher = DockWatcher()
+    private var switcher: Switcher?
     private var hoveredIcon: DockIcon?
     private var showWork: DispatchWorkItem?
     private var outsideSince: Date?
@@ -61,6 +62,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.contentView = host
         panel.orderFrontRegardless()
 
+        switcher = Switcher()
         watcher.onHover = { [weak self] icon in self?.dockHoverChanged(icon) }
         previews.onSpringLoaded = { [weak self] in self?.hidePreviews() }
         previews.$thumbnails

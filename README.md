@@ -77,19 +77,13 @@ Add these hooks to `~/.claude/settings.json` (adjust the path if you cloned else
 
 ## GlassDock
 
-GlassDock (in the `GlassDock/` folder) is a companion app: a Liquid Glass replacement for the macOS Dock, drawn with Core Animation so magnification tracks the cursor at full frame rate.
+GlassDock (in the `GlassDock/` folder) is a companion app that adds window previews to the **real** macOS Dock. The Dock itself is never hidden or changed, so its look, magnification, menus, badges and Mission Control behaviour are all Apple's own.
 
-- Copies your current Dock's apps, order, icon size and magnification, with crisp icons rendered at their exact pixel size.
-- Native-style motion: slides in from off-screen, cosine magnification curve, parabolic launch bounce, eased relax when you leave. Respects Reduce Motion and Light/Dark appearance.
-- Live window previews on hover. Clicking one brings up that exact window, sliding to its desktop if it's on another one. Drag a file onto a preview and hold to spring that window open with the cursor at the same spot.
-- Press darkening, drag to reorder (other icons make room), drag off to remove (with a poof), drop files on an app, the Bin or the Downloads stack.
-- Right-click menu with the app's windows, Options (Keep in Dock, Open at Login, Show in Finder, Assign To desktop), Hide, and Quit (Force Quit with ⌥).
-- Downloads stack (grid of recent downloads), minimised windows beside the Bin, unread badges, running dots, glass name tags, Empty Bin with confirmation.
-- Auto-hides like the native Dock, shows during Mission Control, and stays out of full-screen apps.
+- Hover a running app's icon and its windows appear as glass cards above it. Moving to another icon switches instantly.
+- Click a card to bring up that exact window, sliding to its desktop if it's on another one.
+- Drag a file over a Dock icon, onto a card, and hold: that window springs open with the cursor at the same spot, so you drop the file exactly where you aimed.
 
-`./build.sh` builds it alongside NotchHub. Turn it on with the Dock icon in the Shortcuts header: the macOS Dock is hidden while it runs and your original settings are restored when you switch it off (or if it ever crashes three times in a minute). GlassDock asks for Accessibility (badges, focusing windows, desktop switching) and Screen Recording (previews). Switching to a window on another desktop uses the "Move left/right a space" shortcuts (⌃← / ⌃→), which are on by default.
-
-If your Dock ever stays hidden: `defaults delete com.apple.dock autohide; defaults delete com.apple.dock autohide-delay; killall Dock`
+It follows the Dock's own hover through Accessibility, so it's event-driven and idles at zero. `./build.sh` builds it alongside NotchHub; turn it on with the Dock icon in the Shortcuts header. It asks for Accessibility (following the Dock, focusing windows) and Screen Recording (previews). Switching to a window on another desktop uses the "Move left/right a space" shortcuts (⌃← / ⌃→), which are on by default. Previews assume the Dock is at the bottom of the screen.
 
 ## Edge Shelf
 

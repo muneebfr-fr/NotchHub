@@ -13,103 +13,62 @@ enum Main {
     }
 }
 
-final class DockPanel: NSPanel {
+final class PreviewPanel: NSPanel {
     override var canBecomeKey: Bool { true }
 }
 
+/// GlassDock: window previews for the real macOS Dock. The Dock itself is untouched; this only adds a panel of
+/// live window cards above whichever app icon is hovered.
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private var panel: DockPanel!
-    private var strip: DockStrip!
-    private var previewsHost: NSView!
-    private let model = DockModel()
+    private var panel: PreviewPanel!
     private let previews = PreviewModel()
-    private let extras = DockExtras()
-    private let stack = StackState()
-    private var shownForMissionControl = false
-    private var visible = false
+    private let watcher = DockWatcher()
+    private var hoveredIcon: DockIcon?
+    private var showWork: DispatchWorkItem?
     private var outsideSince: Date?
-    private var hoverWork: DispatchWorkItem?
-    private var signalSources: [DispatchSourceSignal] = []
     private var cancellables: Set<AnyCancellable> = []
 
     // File-drag tracking for spring-loaded previews.
     private var dragChangeCount = NSPasteboard(name: .drag).changeCount
     private var fileDragActive = false
+    private var dragIcons: [DockIcon] = []
+    private var dragIconsAt = Date.distantPast
     private var springAnchor: (id: CGWindowID, point: CGPoint, since: Date)?
 
-    private static let panelHeight: CGFloat = 440
-    private static let previewsBottom: CGFloat = 100
-    private var stripHeight: CGFloat { Self.previewsBottom }
+    private static let panelHeight: CGFloat = 240
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
-        SystemDock.hide()
-        restoreOnSignals()
+        // Older versions hid the Dock; make sure the real one is back.
+        SystemDock.restore()
 
         if !AXIsProcessTrusted() {
-            // Needed to bring a specific window forward from its preview and to read unread badges.
+            // Needed to follow the Dock's hover and to focus the chosen window.
             AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary)
         }
         if !CGPreflightScreenCaptureAccess() { CGRequestScreenCaptureAccess() }
 
-        panel = DockPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        panel = PreviewPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = false
-        panel.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.dockWindow)))
+        panel.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.dockWindow)) + 1)
         panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
         panel.ignoresMouseEvents = true
-
-        let container = NSView()
-        container.wantsLayer = true
-        strip = DockStrip(model: model, extras: extras)
-        container.addSubview(strip)
-        let host = NSHostingView(rootView: PreviewsView().environmentObject(previews).environmentObject(stack).environmentObject(extras))
+        let host = NSHostingView(rootView: PreviewsView().environmentObject(previews))
         host.sizingOptions = []
-        container.addSubview(host)
-        previewsHost = host
-        panel.contentView = container
-        // Hidden views are skipped by layout passes, so the dock's frame updates never touch SwiftUI.
-        host.isHidden = true
-        position()
+        panel.contentView = host
         panel.orderFrontRegardless()
-        extras.refreshLoginItems()
-        applyAccessibilityOptions()
-        NSWorkspace.shared.notificationCenter.addObserver(
-            forName: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: nil, queue: .main
-        ) { [weak self] _ in
-            MainActor.assumeIsolated { self?.applyAccessibilityOptions() }
-        }
 
-        strip.onHoverChange = { [weak self] item in self?.hoverChanged(item) }
-        strip.onActivate = { [weak self] item in self?.activate(item) }
-        strip.menuProvider = { [weak self] item in
-            guard let self else { return nil }
-            return DockMenu.make(for: item, model: self.model, extras: self.extras)
-        }
-        previews.onSpringLoaded = { [weak self] in self?.setVisible(false) }
-        previews.$thumbnails.combineLatest(stack.$isOpen)
+        watcher.onHover = { [weak self] icon in self?.dockHoverChanged(icon) }
+        previews.onSpringLoaded = { [weak self] in self?.hidePreviews() }
+        previews.$thumbnails
             .receive(on: RunLoop.main)
-            .sink { [weak self] thumbs, open in
-                MainActor.assumeIsolated { self?.previewsHost.isHidden = thumbs.isEmpty && !open }
+            .sink { [weak self] thumbs in
+                MainActor.assumeIsolated { if thumbs.isEmpty { self?.panel.ignoresMouseEvents = true } }
             }
             .store(in: &cancellables)
-        previews.$appID
-            .receive(on: RunLoop.main)
-            .sink { [weak self] id in
-                MainActor.assumeIsolated {
-                    self?.strip.holdsShape = id != nil
-                    if id == nil { self?.strip.cursorMoved(toScreen: NSEvent.mouseLocation) }
-                }
-            }
-            .store(in: &cancellables)
-
-        NotificationCenter.default.addObserver(
-            forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
-        ) { [weak self] _ in
-            MainActor.assumeIsolated { self?.position() }
-        }
 
         let handler: (NSEvent) -> Void = { [weak self] _ in
             MainActor.assumeIsolated { self?.mouseMoved() }
@@ -128,14 +87,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 if type == .leftMouseUp { self.endFileDrag() }
             }
         }
-        // Mission Control shows the Dock; GlassDock follows it (a cheap Accessibility check a few times a second).
-        Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.checkMissionControl() }
-        }
-        // Lets the hide grace period expire when the cursor has stopped outside the dock.
-        Timer.scheduledTimer(withTimeInterval: 0.15, repeats: true) { [weak self] _ in
+        // Lets the hide grace period (and a resting drag's spring) complete while the cursor is still.
+        Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
-                guard let self, self.visible else { return }
+                guard let self, self.previews.appID != nil || self.fileDragActive else { return }
                 self.mouseMoved()
                 if NSEvent.pressedMouseButtons & 1 == 0 { self.endFileDrag() }
             }
@@ -146,174 +101,83 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         SystemDock.restore()
     }
 
-    /// `kill`/`killall` skip applicationWillTerminate, so the normal Dock is restored on those signals too.
-    private func restoreOnSignals() {
-        for sig in [SIGTERM, SIGINT, SIGHUP] {
-            signal(sig, SIG_IGN)
-            let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
-            source.setEventHandler {
-                SystemDock.restore()
-                exit(0)
-            }
-            source.resume()
-            signalSources.append(source)
+    // MARK: Hover
+
+    private func dockHoverChanged(_ icon: DockIcon?) {
+        guard let icon else {
+            hoveredIcon = nil
+            showWork?.cancel()
+            return
         }
+        hoveredIcon = icon
+        guard let path = icon.appPath, isRunning(path) else {
+            showWork?.cancel()
+            if previews.appID != nil { hidePreviews() }
+            return
+        }
+        previews.prepare(appPath: path)
+        // Moving between icons while previews are up switches instantly; the first one waits a moment.
+        if previews.appID != nil {
+            present(path, above: icon)
+            return
+        }
+        showWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self, self.hoveredIcon?.appPath == path else { return }
+                self.present(path, above: icon)
+            }
+        }
+        showWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: work)
     }
 
-    private var screen: NSScreen { NSScreen.screens.first ?? NSScreen.main! }
-
-    private func position() {
-        let frame = screen.frame
-        panel.setFrame(CGRect(x: frame.minX, y: frame.minY, width: frame.width, height: Self.panelHeight), display: true)
-        strip.frame = CGRect(x: 0, y: visible ? 0 : hiddenY, width: frame.width, height: stripHeight)
-        previewsHost.frame = CGRect(x: 0, y: Self.previewsBottom, width: frame.width, height: Self.panelHeight - Self.previewsBottom)
+    private func isRunning(_ path: String) -> Bool {
+        NSWorkspace.shared.runningApplications.contains { $0.bundleURL?.path == path }
     }
 
-    // MARK: Auto-hide
+    /// Places the panel just above the icon (which may be magnified) and shows that app's windows.
+    private func present(_ path: String, above icon: DockIcon) {
+        let screen = NSScreen.screens.first { $0.frame.contains(CGPoint(x: icon.frame.midX, y: icon.frame.midY)) } ?? NSScreen.main!
+        panel.setFrame(CGRect(x: screen.frame.minX, y: icon.frame.maxY + 6, width: screen.frame.width, height: Self.panelHeight), display: false)
+        previews.anchorX = icon.frame.midX - screen.frame.minX
+        outsideSince = nil
+        previews.show(appPath: path)
+    }
+
+    private func hidePreviews() {
+        showWork?.cancel()
+        outsideSince = nil
+        previews.hide()
+        panel.ignoresMouseEvents = true
+    }
+
+    /// The preview cards' frame on screen.
+    private var cardsRect: CGRect {
+        let row = previews.rowRect
+        return CGRect(x: panel.frame.minX + row.minX, y: panel.frame.maxY - row.maxY, width: row.width, height: row.height)
+    }
 
     private func mouseMoved() {
         let mouse = NSEvent.mouseLocation
-        let frame = screen.frame
-
-        if !visible {
-            // Revealed by pushing against the bottom edge, like an auto-hiding Dock (not over full-screen apps).
-            if mouse.y <= frame.minY + 1.5, frame.minX...frame.maxX ~= mouse.x, !frontmostIsFullScreen() {
-                setVisible(true)
-            }
-            return
-        }
-
-        strip.cursorMoved(toScreen: mouse)
         trackFileDrag(mouse)
+        guard previews.appID != nil else { return }
 
-        let dock = strip.dockFrame
-        // The bar, plus headroom above it for magnified icons and name tags.
-        var active = CGRect(
-            x: panel.frame.minX + dock.minX - 12,
-            y: frame.minY,
-            width: dock.width + 24,
-            height: dock.maxY + model.largeSize - model.tileSize + 46
-        )
-        if !previews.thumbnails.isEmpty || stack.isOpen {
-            let row = previews.rowRect
-            let host = previewsHost.frame
-            let onScreen = CGRect(
-                x: panel.frame.minX + host.minX + row.minX,
-                y: panel.frame.minY + host.maxY - row.maxY,
-                width: row.width,
-                height: row.height
-            )
-            active = active.union(onScreen.insetBy(dx: -12, dy: -12))
-        }
-        let inside = active.contains(mouse) || shownForMissionControl
-        panel.ignoresMouseEvents = !inside
+        // Stays open over the cards, over the hovered icon, and across the small gap between them.
+        let cards = cardsRect.insetBy(dx: -14, dy: -14)
+        let bridge = hoveredIcon.map { icon -> CGRect in
+            let minX = min(icon.frame.minX, cards.minX), maxX = max(icon.frame.maxX, cards.maxX)
+            return CGRect(x: minX, y: icon.frame.minY, width: maxX - minX, height: max(1, cards.minY - icon.frame.minY + 1))
+        } ?? .null
+        let overCards = !previews.thumbnails.isEmpty && cards.contains(mouse)
+        panel.ignoresMouseEvents = !overCards
 
-        if inside {
+        if overCards || hoveredIcon != nil || bridge.contains(mouse) || fileDragActive {
             outsideSince = nil
-        } else if outsideSince == nil, !fileDragActive {
-            // Leaving: previews close and the icons relax straight away; the dock itself slides off after a beat.
-            hoverWork?.cancel()
-            previews.hide()
-            stack.isOpen = false
-            strip.holdsShape = false
-            strip.cursorLeft()
-            outsideSince = Date()
         } else if let since = outsideSince {
-            if Date().timeIntervalSince(since) > 0.45 { setVisible(false) }
+            if Date().timeIntervalSince(since) > 0.3 { hidePreviews() }
         } else {
             outsideSince = Date()
-        }
-    }
-
-    /// Fully below the screen when hidden, so it slides in from off-screen like the native Dock.
-    private var hiddenY: CGFloat { -(stripHeight + 12) }
-
-    private func setVisible(_ show: Bool) {
-        guard show != visible else { return }
-        visible = show
-        outsideSince = nil
-        panel.ignoresMouseEvents = !show
-        model.setBadgePolling(show)
-        if show {
-            model.rebuild()
-            extras.refreshMinimized()
-        } else {
-            hoverWork?.cancel()
-            previews.hide()
-            stack.isOpen = false
-            strip.holdsShape = false
-            strip.cursorLeft()
-        }
-        let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-        if reduceMotion {
-            // Reduce Motion: a quick fade instead of a slide.
-            strip.setFrameOrigin(CGPoint(x: 0, y: 0))
-            NSAnimationContext.runAnimationGroup { context in
-                context.duration = 0.18
-                strip.animator().alphaValue = show ? 1 : 0
-            }
-            return
-        }
-        strip.alphaValue = 1
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = show ? 0.3 : 0.32
-            context.timingFunction = show
-                ? CAMediaTimingFunction(controlPoints: 0.16, 0.84, 0.3, 1.0)
-                : CAMediaTimingFunction(controlPoints: 0.42, 0.0, 0.58, 1.0)
-            context.allowsImplicitAnimation = true
-            strip.animator().setFrameOrigin(CGPoint(x: 0, y: show ? 0 : hiddenY))
-        }
-    }
-
-    private func applyAccessibilityOptions() {
-        strip.reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-        if !visible {
-            strip.setFrameOrigin(CGPoint(x: 0, y: strip.reduceMotion ? 0 : hiddenY))
-            strip.alphaValue = strip.reduceMotion ? 0 : 1
-        }
-    }
-
-    private func checkMissionControl() {
-        let active = Self.isMissionControlActive()
-        if active, !visible {
-            shownForMissionControl = true
-            setVisible(true)
-        } else if !active, shownForMissionControl {
-            shownForMissionControl = false
-            mouseMoved()
-        }
-    }
-
-    private static func isMissionControlActive() -> Bool {
-        guard let dock = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.dock").first else { return false }
-        var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(AXUIElementCreateApplication(dock.processIdentifier), kAXChildrenAttribute as CFString, &value) == .success,
-              let children = value as? [AXUIElement]
-        else { return false }
-        return children.contains { child in
-            var identifier: CFTypeRef?
-            AXUIElementCopyAttributeValue(child, kAXIdentifierAttribute as CFString, &identifier)
-            return identifier as? String == "mc"
-        }
-    }
-
-    // MARK: Stacks and minimised windows
-
-    private func activate(_ item: DockStrip.Item) {
-        switch item {
-        case .downloads:
-            if stack.isOpen {
-                stack.isOpen = false
-            } else {
-                previews.hide()
-                extras.refreshDownloads()
-                if let frame = strip.iconFrameOnScreen("downloads") { stack.anchorX = frame.midX - panel.frame.minX }
-                stack.isOpen = true
-            }
-        case .minimized(let window):
-            extras.restore(window)
-        default:
-            break
         }
     }
 
@@ -328,11 +192,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             fileDragActive = true
             previews.dragIcon = NSWorkspace.shared.icon(forFile: first.path)
         }
-        guard !previews.thumbnails.isEmpty else { return }
 
+        // While dragging, the Dock doesn't report hover, so icons are hit-tested directly (frames refreshed
+        // a few times a second as the Dock magnifies).
+        if Date().timeIntervalSince(dragIconsAt) > 0.25 {
+            dragIcons = watcher.appIcons()
+            dragIconsAt = Date()
+        }
+        let underCursor = dragIcons.first { $0.frame.insetBy(dx: -2, dy: -6).contains(mouse) }
+        if let icon = underCursor, icon.appPath != hoveredIcon?.appPath {
+            dockHoverChanged(icon)
+        } else if underCursor == nil, hoveredIcon != nil {
+            hoveredIcon = nil
+        }
+
+        guard !previews.thumbnails.isEmpty else { return }
         // Mouse position in the previews overlay's top-left coordinates.
-        let host = previewsHost.frame
-        let local = CGPoint(x: mouse.x - panel.frame.minX - host.minX, y: panel.frame.minY + host.maxY - mouse.y)
+        let local = CGPoint(x: mouse.x - panel.frame.minX, y: panel.frame.maxY - mouse.y)
         guard let (id, frame) = previews.imageFrames.first(where: { id, frame in
             frame.contains(local) && previews.thumbnails.contains { $0.id == id }
         }) else {
@@ -360,45 +236,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard fileDragActive else { return }
         fileDragActive = false
         springAnchor = nil
+        dragIcons = []
         previews.dragMarker = nil
         previews.dragIcon = nil
-    }
-
-    // MARK: Previews
-
-    private func hoverChanged(_ item: DockStrip.Item?) {
-        hoverWork?.cancel()
-        guard let app = item?.app, app.running, !stack.isOpen else { return }
-        if let frame = strip.iconFrameOnScreen(app.id) {
-            previews.anchorX = frame.midX - panel.frame.minX
-        }
-        previews.prepare(app)
-        // Switching between icons while previews are already up is instant; the first one waits a moment.
-        if previews.appID != nil {
-            previews.show(for: app)
-            return
-        }
-        let work = DispatchWorkItem { [weak self] in
-            MainActor.assumeIsolated {
-                guard let self, self.strip.hovered == app.id else { return }
-                self.previews.show(for: app)
-            }
-        }
-        hoverWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: work)
-    }
-
-    private func frontmostIsFullScreen() -> Bool {
-        guard let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier,
-              let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]]
-        else { return false }
-        let size = screen.frame.size
-        return windows.contains { window in
-            guard (window[kCGWindowOwnerPID as String] as? pid_t) == pid,
-                  (window[kCGWindowLayer as String] as? Int) == 0,
-                  let bounds = window[kCGWindowBounds as String] as? [String: CGFloat]
-            else { return false }
-            return bounds["Width"] == size.width && bounds["Height"] == size.height
-        }
     }
 }

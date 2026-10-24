@@ -894,7 +894,7 @@ struct ShortcutsCard: View {
                 )
                 CompanionToggle(
                     app: companions.glassDock, onSymbol: "dock.rectangle", offSymbol: "dock.arrow.down.rectangle",
-                    onHelp: "GlassDock is on. Click to go back to the normal Dock", offHelp: "Turn on GlassDock"
+                    onHelp: "Dock window previews are on. Click to turn them off", offHelp: "Turn on Dock window previews (GlassDock)"
                 )
                 Button { NSApp.terminate(nil) } label: {
                     Image(systemName: "power")

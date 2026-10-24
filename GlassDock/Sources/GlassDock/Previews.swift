@@ -26,10 +26,9 @@ final class PreviewModel: ObservableObject {
     private var loading: [String: Task<Void, Never>] = [:]
 
     /// Starts capturing as soon as an icon is hovered, so previews are usually ready when they're shown.
-    func prepare(_ app: DockApp) {
-        guard app.running, loading[app.id] == nil else { return }
-        if let cached = cache[app.id], Date().timeIntervalSince(cached.at) < 2 { return }
-        let id = app.id
+    func prepare(appPath id: String) {
+        guard loading[id] == nil else { return }
+        if let cached = cache[id], Date().timeIntervalSince(cached.at) < 2 { return }
         loading[id] = Task { [weak self] in
             let thumbs = await Self.capture(appPath: id)
             guard let self else { return }
@@ -41,12 +40,12 @@ final class PreviewModel: ObservableObject {
         }
     }
 
-    func show(for app: DockApp) {
-        guard appID != app.id else { return }
-        appID = app.id
+    func show(appPath id: String) {
+        guard appID != id else { return }
+        appID = id
         // Cached thumbnails appear instantly and are refreshed in the background.
-        withAnimation(.spring(duration: 0.35, bounce: 0.12)) { thumbnails = cache[app.id]?.thumbnails ?? [] }
-        prepare(app)
+        withAnimation(.spring(duration: 0.35, bounce: 0.12)) { thumbnails = cache[id]?.thumbnails ?? [] }
+        prepare(appPath: id)
     }
 
     func hide() {

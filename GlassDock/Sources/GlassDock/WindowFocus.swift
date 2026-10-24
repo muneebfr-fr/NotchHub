@@ -32,7 +32,7 @@ enum WindowFocus {
         }
         guard let steps = desktopSteps(to: windowID), steps != 0, moveShortcutsEnabled else {
             log.info("focus: can't route to window's desktop; activating app")
-            DockModel.bringForward(app)
+            WindowFocus.bringForward(app)
             return
         }
         log.info("focus: moving \(steps, privacy: .public) desktop(s)")
@@ -42,12 +42,25 @@ enum WindowFocus {
 
     // MARK: Raising
 
+    /// macOS ignores activation requests from background apps, so this goes through Accessibility, which
+    /// activates the app and switches to the desktop of its most recent window.
+    static func bringForward(_ app: NSRunningApplication, raiseMain: Bool = true) {
+        let element = AXUIElementCreateApplication(app.processIdentifier)
+        AXUIElementSetAttributeValue(element, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
+        var window: CFTypeRef?
+        // When a specific window was just raised, don't raise the app's main window over it.
+        if raiseMain, AXUIElementCopyAttributeValue(element, kAXMainWindowAttribute as CFString, &window) == .success, let window {
+            AXUIElementPerformAction(window as! AXUIElement, kAXRaiseAction as CFString)
+        }
+        app.activate(options: [.activateAllWindows])
+    }
+
     private static func raise(pid: pid_t, windowID: CGWindowID, title: String, app: NSRunningApplication) {
         if let window = axWindow(pid: pid, windowID: windowID, title: title) {
             AXUIElementPerformAction(window, kAXRaiseAction as CFString)
             AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue)
         }
-        DockModel.bringForward(app, raiseMain: false)
+        WindowFocus.bringForward(app, raiseMain: false)
     }
 
     /// After a desktop slide: polls until the window is on screen and Accessibility can see it (the app only
@@ -60,7 +73,7 @@ enum WindowFocus {
                 waitForWindow(windowID, pid: pid, title: title, app: app, deadline: deadline)
             } else {
                 log.info("focus: window didn't appear in time; activating app")
-                DockModel.bringForward(app)
+                WindowFocus.bringForward(app)
             }
         }
     }
